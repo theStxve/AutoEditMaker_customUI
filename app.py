@@ -1903,6 +1903,20 @@ class EditMakerApp(ctk.CTk):
     def show_info(self, title, msg):
         self._ui_after(0, lambda: messagebox.showinfo(title, msg))
 
+    def _center_window(self, win, min_w=0, min_h=0):
+        """Fenster mittig auf dem Bildschirm platzieren (auch vor dem Layout)."""
+        try:
+            win.update_idletasks()
+            w = max(min_w, win.winfo_reqwidth(), win.winfo_width())
+            h = max(min_h, win.winfo_reqheight(), win.winfo_height())
+            sw = win.winfo_screenwidth()
+            sh = win.winfo_screenheight()
+            x = max(0, int((sw - w) / 2))
+            y = max(0, int((sh - h) / 2))
+            win.geometry(f"{int(w)}x{int(h)}+{x}+{y}")
+        except Exception as e:
+            print(f"[UI] Zentrieren fehlgeschlagen: {e}")
+
     def show_render_done(self, out_path, extra_msg=""):
         """
         Fertig-Dialog mit Direktzugriff: ansehen, Ordner oeffnen, schliessen.
@@ -1918,7 +1932,6 @@ class EditMakerApp(ctk.CTk):
             win = ctk.CTkToplevel(self)
             self._done_win = win
             win.title("Fertig")
-            win.geometry("560x290")
             win.resizable(False, False)
             win.transient(self)
             win.attributes("-topmost", True)
@@ -1989,6 +2002,7 @@ class EditMakerApp(ctk.CTk):
             ).pack(side="left", padx=8)
 
             win.protocol("WM_DELETE_WINDOW", _close)
+            self._center_window(win, min_w=520, min_h=260)
             win.after(250, lambda: win.attributes("-topmost", False))
             return win
 
@@ -2676,7 +2690,6 @@ class EditMakerApp(ctk.CTk):
 
         win = ctk.CTkToplevel(parent)
         win.title("Latenz kalibrieren")
-        win.geometry("500x430")
         win.resizable(False, False)
         win.transient(parent)
         win.grab_set()
@@ -2834,6 +2847,7 @@ class EditMakerApp(ctk.CTk):
         ).pack(pady=(0, 12))
 
         win.protocol("WM_DELETE_WINDOW", lambda: (_cleanup(), win.destroy()))
+        self._center_window(win, min_w=500, min_h=400)
         return win, result
 
     # =====================================================================
