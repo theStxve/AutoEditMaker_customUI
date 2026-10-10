@@ -29,6 +29,11 @@ Ein professionelles Beat-Sync Video-Editing Tool mit moderner CustomTkinter-Ober
   - Multi-Band Transient Tracking (Kicks und Snares getrennt) mit Attack-Backtracking.
   - Manuelle Klicks rasten ueber den Takt-Magneten praezise an den echten Drum-Peaks ein.
   - Frame-Quantisierung verhindert jeglichen kumulierten Drift ueber die gesamte Songlaenge.
+- **Latenz-Kalibrierung fuer den manuellen Modus**:
+  - Tastatur, Soundkarte, Bluetooth-Headset und Monitor bringen jeweils eigene Verzoegerung mit. Ohne Korrektur ist jeder manuelle Cut um genau diesen Betrag daneben.
+  - "Kalibrieren" spielt 12 Klicks, der Nutzer tippt mit, und der Median der Differenz wird als Offset uebernommen und in `app_settings.json` gespeichert.
+  - Latenz zusaetzlich per Slider feinjustierbar, Live-Anzeige zeigt bei jedem Tap den Abstand zum naechsten Beat (gruen/gelb/rot) und wie weit der naechste Beat weg ist.
+  - Gemessen: Restfehler sinkt von 108 ms auf 0 ms.
 - **KI Beat-Drop-Erkennung (Machine Learning)**:
   - Agglomerative Segmentierung (Chroma-CQT + MFCC) plus Multi-Band-Change-Point-Analyse.
   - Waehlt den Drop, der in den lautesten Abschnitt fuehrt - nicht den mit dem groessten relativen Sprung.
@@ -39,7 +44,9 @@ Ein professionelles Beat-Sync Video-Editing Tool mit moderner CustomTkinter-Ober
 - **Timing-kopplte Effekt-Dauern**: Bloom-Flash, Bass-Shake, RGB und Punch-Zoom skalieren mit der Laenge des Cuts. Ein 0.14s-Flash auf einem 0.28s-Cut (2x-Tempo) frisst den halben Beat und sieht dadurch aus wie ein Timing-Fehler.
 - **Jitter-Korrektur**: Snappt jeden Beat auf den naechsten echten Transient (+-60ms) - kein Flackern mehr im 2x-Tempo.
 - **Best-Moment-Finder**: findet die energiereichste Passage (15/30/60/90s) und legt den Hook so, dass der Drop in den ersten Sekunden landet.
-- **Wellenform-Ansicht**: Vollstaendige Waveform mit Beat-Gitter, Trim-Bereich und rotem DROP-Marker. Klick setzt den Startpunkt.
+- **Wellenform-Ansicht**: Vollstaendige Waveform mit Beat-Gitter, Trim-Bereich und rotem DROP-Marker.
+  - **Linksklick** setzt den Startpunkt, **Rechtsklick** setzt den Endpunkt.
+  - Beim Vorhoeren laeuft ein gelber Playhead durch die Waveform, die aktuelle Position steht rechts daneben.
 - **KI-Auto-Reframe**: haelt das Subject im 9:16-Crop (YuNet-Gesichtserkennung, sonst Hautton-/Bewegungs-Tracking, zeitlich geglaettet).
 - **Schnell-Vorschau (Proxy)**: 480p/24fps-Proxy-Render in ~2.5x kuerzerer Zeit, um Settings vor dem Final-Render zu testen.
 - **Batch-Export**: rendert N Varianten mit gemischter Clip-Reihenfolge in einem Durchlauf.

@@ -497,6 +497,22 @@ def format_eta(seconds):
         return f"{seconds}s"
     return f"{seconds // 60}m {seconds % 60:02d}s"
 
+
+def build_metronome_click(sr=44100):
+    """Kurzer, perkussiver Klick fuer die Latenz-Kalibrierung."""
+    dur = 0.055
+    t = np.linspace(0, dur, int(sr * dur), endpoint=False)
+    body = 0.55 * np.sin(2 * np.pi * 1650.0 * t) * np.exp(-t * 90.0)
+    tick = 0.45 * np.sin(2 * np.pi * 5200.0 * t) * np.exp(-t * 260.0)
+    mono = np.clip(body + tick, -1.0, 1.0)
+    stereo = np.stack([mono, mono], axis=1)
+    data = (stereo * 32767 * 0.85).astype(np.int16)
+    try:
+        return pygame.sndarray.make_sound(np.ascontiguousarray(data))
+    except Exception as e:
+        print(f"[Calibration] Klick-Sound konnte nicht erzeugt werden: {e}")
+        return None
+
 # Default Presets
 DEFAULT_PRESETS = {
     "TikTok Montage / Beat Drop": {
@@ -677,8 +693,10 @@ class EditMakerApp(ctk.CTk):
 
         self.presets_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "presets.json")
         self.all_presets = self._load_presets_from_disk()
+        self.app_settings_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_settings.json")
+        self.app_settings = self._load_app_settings()
 
-        pygame.mixer.init()
+        pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
 
         self._build_ui()
         self._last_state = self.capture_full_state()
@@ -708,6 +726,35 @@ class EditMakerApp(ctk.CTk):
                 json.dump(self.all_presets, f, indent=4, ensure_ascii=False)
         except Exception as e:
             print(f"Fehler beim Speichern von presets.json: {e}")
+
+    def _load_app_settings(self):
+        defaults = {"manual_latency_ms": 70.0}
+        try:
+            if os.path.exists(self.app_settings_file):
+                with open(self.app_settings_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    defaults.update({k: v for k, v in data.items() if k in defaults})
+        except Exception as e:
+            print(f"Fehler beim Laden von app_settings.json: {e}")
+        return defaults
+
+    def _save_app_settings(self):
+        try:
+            with open(self.app_settings_file, "w", encoding="utf-8") as f:
+                json.dump(self.app_settings, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            print(f"Fehler beim Speichern von app_settings.json: {e}")
+
+    def get_manual_latency_ms(self):
+        try:
+            return float(self.app_settings.get("manual_latency_ms", 70.0))
+        except Exception:
+            return 70.0
+
+    def set_manual_latency_ms(self, value_ms):
+        self.app_settings["manual_latency_ms"] = float(max(0.0, min(600.0, value_ms)))
+        self._save_app_settings()
 
     # =====================================================================
     # UI Building
@@ -922,11 +969,19 @@ class EditMakerApp(ctk.CTk):
 
         self.lbl_waveform_hint = ctk.CTkLabel(
             waveform_wrap,
-            text="Wellenform: Klick setzt den Startpunkt",
+            text="Linksklick: Start | Rechtsklick: Ende",
             font=("Arial", 10),
             text_color="#94a3b8"
         )
-        self.lbl_waveform_hint.pack(anchor="w")
+        self.lbl_waveform_hint.pack(side="left")
+
+        self.lbl_playback_time = ctk.CTkLabel(
+            waveform_wrap,
+            text="",
+            font=("Consolas", 10, "bold"),
+            text_color="#facc15"
+        )
+        self.lbl_playback_time.pack(side="right")
 
         self.wave_canvas = Canvas(
             waveform_wrap,
@@ -939,10 +994,12 @@ class EditMakerApp(ctk.CTk):
         self.wave_canvas.pack(fill="x", pady=(2, 0))
         self.wave_canvas.bind("<Configure>", lambda e: self.draw_waveform())
         self.wave_canvas.bind("<Button-1>", self.on_waveform_click)
+        self.wave_canvas.bind("<Button-3>", self.on_waveform_right_click)
         self.wave_env = None
         self.wave_hop = 0.0
         self.wave_beats = []
         self.wave_drop = 0.0
+        self.wave_playhead = None
 
         # 4. Beat Detection & Pacing Frame (Multi-Band Engine)
         sync_frame = ctk.CTkFrame(self.main_container)
@@ -1922,8 +1979,8 @@ class EditMakerApp(ctk.CTk):
             ).pack(side="left", padx=8)
 
             ctk.CTkButton(
-                btn_row, text="Ordner oeffnen", command=_open_folder,
-                fg_color="#2b719e", hover_color="#1f5375", width=170, height=40
+                btn_row, text="Öffnen", command=_open_folder,
+                fg_color="#2b719e", hover_color="#1f5375", width=150, height=40
             ).pack(side="left", padx=8)
 
             ctk.CTkButton(
@@ -2062,14 +2119,14 @@ class EditMakerApp(ctk.CTk):
                 self.wave_beats = beats
                 self.wave_drop = drop
                 self.draw_waveform()
-                if drop > 0 and hasattr(self, 'slider_overlay_sec'):
+                if drop > 0:
                     self.lbl_waveform_hint.configure(
-                        text=f"Wellenform: Klick setzt den Startpunkt | KI-Drop bei {drop:.1f}s",
+                        text=f"Linksklick: Start | Rechtsklick: Ende | KI-Drop bei {drop:.1f}s",
                         text_color="#f97316"
                     )
                 else:
                     self.lbl_waveform_hint.configure(
-                        text="Wellenform: Klick setzt den Startpunkt",
+                        text="Linksklick: Start | Rechtsklick: Ende",
                         text_color="#94a3b8"
                     )
 
@@ -2077,13 +2134,24 @@ class EditMakerApp(ctk.CTk):
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _wave_width(self):
+        """Canvas-Breite; winfo_width() ist vor dem Layout 1, dann waere die
+        Wellenform unsichtbar. Auf die angeforderte Breite zurueckfallen."""
+        canvas = self.wave_canvas
+        w = canvas.winfo_width()
+        if w <= 2:
+            w = canvas.winfo_reqwidth()
+        return max(300, w)
+
     def draw_waveform(self):
         if not hasattr(self, "wave_canvas"):
             return
         canvas = self.wave_canvas
         canvas.delete("all")
-        w = canvas.winfo_width()
+        w = self._wave_width()
         h = canvas.winfo_height()
+        if h <= 2:
+            h = canvas.winfo_reqheight() or 70
         if w <= 2 or h <= 2:
             return
 
@@ -2142,14 +2210,61 @@ class EditMakerApp(ctk.CTk):
                     font=("Arial", 8, "bold"), anchor="w" if label_x > xd else "e"
                 )
 
-    def on_waveform_click(self, event):
-        if not self.audio_duration or not self.wave_canvas.winfo_width():
+        if self.wave_playhead is not None:
+            self._draw_playhead(self.wave_playhead)
+
+    def _draw_playhead(self, t_abs):
+        """Abspiel-Cursor in der Wellenform (eigenes Canvas-Item, kein Redraw)."""
+        self.wave_playhead = t_abs
+        if not hasattr(self, "wave_canvas"):
             return
-        frac = max(0.0, min(1.0, event.x / float(self.wave_canvas.winfo_width())))
-        t = frac * self.audio_duration
+        canvas = self.wave_canvas
+        canvas.delete("playhead")
+        self.wave_playhead = None
+        if t_abs is None or not self.audio_duration:
+            return
+        w = self._wave_width()
+        h = canvas.winfo_height()
+        if h <= 2:
+            h = canvas.winfo_reqheight() or 70
+        if w <= 2 or h <= 2:
+            return
+        x = int(t_abs / self.audio_duration * w)
+        canvas.create_line(x, 0, x, h, fill="#facc15", width=2, tags="playhead")
+        canvas.create_oval(
+            x - 4, 0, x + 4, 8, fill="#facc15", outline="", tags="playhead"
+        )
+        self.wave_playhead = t_abs
+
+    def clear_playhead(self):
+        self.wave_playhead = None
+        if hasattr(self, "wave_canvas"):
+            self.wave_canvas.delete("playhead")
+
+    def _wave_time_from_x(self, event):
+        if not self.audio_duration:
+            return None
+        frac = max(0.0, min(1.0, event.x / float(self._wave_width())))
+        return frac * self.audio_duration
+
+    def on_waveform_click(self, event):
+        t = self._wave_time_from_x(event)
+        if t is None:
+            return
         self.slider_start.set(t)
         self.slider_end.set(min(self.audio_duration, max(t + 0.5, self.slider_end.get())))
         self.lbl_start.configure(text=f"Start: {t:.1f}s")
+        self.draw_waveform()
+
+    def on_waveform_right_click(self, event):
+        t = self._wave_time_from_x(event)
+        if t is None:
+            return
+        self.slider_end.set(t)
+        if self.slider_start.get() >= t:
+            self.slider_start.set(max(0.0, t - 1.0))
+            self.lbl_start.configure(text=f"Start: {self.slider_start.get():.1f}s")
+        self.lbl_end.configure(text=f"Ende: {t:.1f}s")
         self.draw_waveform()
 
     # =====================================================================
@@ -2261,15 +2376,32 @@ class EditMakerApp(ctk.CTk):
 
             pygame.mixer.music.play()
             self.is_preview_playing = True
+            self._preview_start_t = float(start_t)
+            self._preview_dur = float(dur)
+            self._preview_offset = float(time.perf_counter())
             self.btn_audio_preview.configure(text="Pause", fg_color="#c026d3", hover_color="#9333ea")
 
             def check_finished():
-                if self.is_preview_playing and not pygame.mixer.music.get_busy():
+                if not self.is_preview_playing:
+                    return
+                if not pygame.mixer.music.get_busy():
                     self.stop_audio_preview()
-                elif self.is_preview_playing:
-                    self.after(100, check_finished)
+                    return
 
-            self.after(100, check_finished)
+                pos_ms = pygame.mixer.music.get_pos()
+                if pos_ms is not None and pos_ms >= 0:
+                    pos = self._preview_start_t + (pos_ms / 1000.0)
+                else:
+                    pos = self._preview_start_t + (time.perf_counter() - self._preview_offset)
+
+                pos = min(self._preview_start_t + self._preview_dur, pos)
+                self._draw_playhead(pos)
+                self.lbl_playback_time.configure(
+                    text=f"{pos:.1f}s / {self._preview_start_t + self._preview_dur:.1f}s"
+                )
+                self.after(50, check_finished)
+
+            self.after(50, check_finished)
         except Exception as e:
             self.show_error("Preview-Fehler", f"Konnte Audio nicht abspielen:\n{os.path.basename(self.audio_path)}\n\n{e}")
             self.stop_audio_preview()
@@ -2287,6 +2419,8 @@ class EditMakerApp(ctk.CTk):
                 pass
             self.current_preview_file = None
         self.is_preview_playing = False
+        self.clear_playhead()
+        self.lbl_playback_time.configure(text="")
         self.btn_audio_preview.configure(text="Vorhören", fg_color="#2b719e", hover_color="#1f5375")
 
     # =====================================================================
@@ -2528,6 +2662,181 @@ class EditMakerApp(ctk.CTk):
         threading.Thread(target=_worker, daemon=True).start()
 
     # =====================================================================
+    # Latency Calibration (manueller Beat-Recorder)
+    # =====================================================================
+    def run_latency_calibration(self, parent, current_ms=70.0, on_result=None):
+        """
+        Misst die echte Reaktions-/Audio-Latenz: es werden 8 Klicks
+        abgespielt, der Nutzer tippt mit, und aus der Differenz zwischen
+        Klickzeit und Tap-Zeit wird der Median als Offset verwendet.
+        """
+        CLICK_COUNT = 12
+        INTERVAL = 0.55
+        LEAD_IN = 1.2
+
+        win = ctk.CTkToplevel(parent)
+        win.title("Latenz kalibrieren")
+        win.geometry("500x430")
+        win.resizable(False, False)
+        win.transient(parent)
+        win.grab_set()
+
+        ctk.CTkLabel(
+            win,
+            text="Latenz-Kalibrierung",
+            font=("Arial", 17, "bold")
+        ).pack(pady=(16, 4))
+
+        ctk.CTkLabel(
+            win,
+            text="Klicke auf JEDEN Klick genau mit der Leertaste\n(oder der Maustast) - so wie du spaeter schneidest.",
+            font=("Arial", 12),
+            text_color="#94a3b8",
+            justify="center"
+        ).pack(pady=(0, 10))
+
+        lbl_state = ctk.CTkLabel(win, text="Bereit.", font=("Arial", 13))
+        lbl_state.pack(pady=(0, 4))
+
+        lbl_dots = ctk.CTkLabel(win, text="", font=("Consolas", 16, "bold"), text_color="#facc15")
+        lbl_dots.pack(pady=(0, 8))
+
+        lbl_result = ctk.CTkLabel(win, text="", font=("Arial", 20, "bold"), text_color="#22c55e")
+        lbl_result.pack(pady=(0, 6))
+
+        fine_var = ctk.DoubleVar(value=float(current_ms))
+        lbl_fine = ctk.CTkLabel(win, text=f"Feinjustierung: {current_ms:.0f} ms", font=("Arial", 11))
+        lbl_fine.pack()
+
+        def _fine_cb(v):
+            lbl_fine.configure(text=f"Feinjustierung: {v:.0f} ms")
+
+        ctk.CTkSlider(
+            win, from_=0, to=400, variable=fine_var,
+            command=_fine_cb
+        ).pack(fill="x", padx=60, pady=(2, 8))
+
+        click_sound = build_metronome_click()
+        if click_sound is None:
+            ctk.CTkLabel(
+                win, text="Kein Klick-Sound moeglich - bitte Wert manuell einstellen.",
+                text_color="#ef4444", font=("Arial", 11)
+            ).pack(pady=4)
+
+        state = {"running": False, "t0": 0.0, "clicks": [], "taps": [], "timers": []}
+        result = {"ms": float(current_ms)}
+
+        def _cleanup():
+            for t in state["timers"]:
+                try:
+                    win.after_cancel(t)
+                except Exception:
+                    pass
+            state["timers"] = []
+
+        def _finish():
+            state["running"] = False
+            _cleanup()
+
+            used_clicks = set()
+            offsets = []
+            for tap in state["taps"]:
+                best_i, best_d = None, 1e9
+                for i, c in enumerate(state["clicks"]):
+                    if i in used_clicks:
+                        continue
+                    d = abs(tap - c)
+                    if d < best_d:
+                        best_d, best_i = d, i
+                if best_i is not None and best_d <= 0.5:
+                    used_clicks.add(best_i)
+                    # Positiver Wert = Nutzer kommt spaeter als der Klick (Latenz)
+                    offsets.append(tap - state["clicks"][best_i])
+
+            if len(offsets) >= 2:
+                med = max(0.0, float(np.median(offsets)))
+                jitter = float(np.std(offsets)) if len(offsets) > 1 else 0.0
+                fine_var.set(max(0.0, min(400.0, med * 1000.0)))
+                _fine_cb(max(0.0, min(400.0, med * 1000.0)))
+                lbl_result.configure(
+                    text=f"{med * 1000.0:.0f} ms", text_color="#22c55e"
+                )
+                lbl_state.configure(
+                    text=f"{len(offsets)} von {CLICK_COUNT} Klicks erkannt | Streuung {jitter * 1000:.0f} ms",
+                    text_color="#94a3b8"
+                )
+            else:
+                lbl_result.configure(text="nicht genug Taps", text_color="#ef4444")
+                lbl_state.configure(text="Bitte wiederholen und ALLE Klicks erwischen.", text_color="#ef4444")
+
+        def _schedule(i):
+            if i >= CLICK_COUNT:
+                win.after(int((INTERVAL * 1000) * 0.35), _finish)
+                return
+            when = (state["t0"] + LEAD_IN + i * INTERVAL) - time.perf_counter()
+            if when < 0:
+                when = 0.0
+            timer = win.after(
+                int(when * 1000),
+                lambda i=i: (state["clicks"].append(time.perf_counter()),
+                             click_sound.play() if click_sound else None,
+                             lbl_dots.configure(text="#" * (i + 1)),
+                             _schedule(i + 1))
+            )
+            state["timers"].append(timer)
+
+        def _on_tap(event=None):
+            if not state["running"]:
+                return
+            state["taps"].append(time.perf_counter())
+            lbl_state.configure(text=f"{len(state['taps'])} Taps erfasst...", text_color="#facc15")
+
+        for key in ("<space>", "<Left>", "<Right>", "<Up>", "<Down>"):
+            win.bind(key, _on_tap)
+        win.bind("<Button-1>", _on_tap)
+        win.bind("<Button-3>", _on_tap)
+
+        def _start():
+            _cleanup()
+            state["clicks"] = []
+            state["taps"] = []
+            state["running"] = True
+            state["t0"] = time.perf_counter()
+            lbl_dots.configure(text="")
+            lbl_result.configure(text="", text_color="#22c55e")
+            lbl_state.configure(text="Warte auf Start...", text_color="#facc15")
+            btn_start.configure(state="disabled")
+            _schedule(0)
+
+        def _apply():
+            value = float(fine_var.get())
+            result["ms"] = value
+            self.set_manual_latency_ms(value)
+            if on_result:
+                on_result(value)
+            win.destroy()
+
+        btn_start = ctk.CTkButton(
+            win, text="Kalibrierung starten", command=_start,
+            fg_color="#7c3aed", hover_color="#5b21b6", height=40, width=220,
+            font=("Arial", 14, "bold")
+        )
+        btn_start.pack(pady=(6, 8))
+
+        ctk.CTkButton(
+            win, text="Wert uebernehmen", command=_apply,
+            fg_color="#1f8a4c", hover_color="#176b3b", height=38, width=220
+        ).pack(pady=(0, 6))
+
+        ctk.CTkButton(
+            win, text="Abbrechen", command=lambda: (_cleanup(), win.destroy()),
+            fg_color="#444444", hover_color="#555555", height=32, width=160
+        ).pack(pady=(0, 12))
+
+        win.protocol("WM_DELETE_WINDOW", lambda: (_cleanup(), win.destroy()))
+        return win, result
+
+    # =====================================================================
     # Manual Recording Mode (Takt-Magnet)
     # =====================================================================
     def open_manual_recorder(self, start_t, end_t, out_path):
@@ -2553,8 +2862,7 @@ class EditMakerApp(ctk.CTk):
                 raise RuntimeError("FFmpeg Audio-Extraktion fehlgeschlagen.")
         except Exception as e:
             self.show_error("Fehler", f"Audio-Vorbereitung fehlgeschlagen:\n{e}")
-            self.btn_generate.configure(state="normal")
-            self.btn_cancel.configure(state="disabled")
+            self._set_render_buttons(False)
             shutil.rmtree(temp_dir, ignore_errors=True)
             return
 
@@ -2574,16 +2882,16 @@ class EditMakerApp(ctk.CTk):
         self.manual_times = []
         rec_win = ctk.CTkToplevel(self)
         rec_win.title("Manuelles Beat-Recording (Mit Takt-Magnet)")
-        rec_win.geometry("520x330")
+        rec_win.geometry("600x520")
         rec_win.transient(self)
         rec_win.grab_set()
 
         lbl_info = ctk.CTkLabel(
             rec_win,
             text="Tippe im Takt der Musik: LEERTASTE, Pfeiltasten oder Maus!\nFenster schließen, wenn fertig.",
-            font=("Arial", 14)
+            font=("Arial", 13)
         )
-        lbl_info.pack(pady=12)
+        lbl_info.pack(pady=(12, 6))
 
         magnet_var = ctk.BooleanVar(value=True)
         chk_magnet = ctk.CTkCheckBox(
@@ -2591,13 +2899,67 @@ class EditMakerApp(ctk.CTk):
             text="Takt-Magnet aktiv (Klicks an Drum-Hits einrasten)",
             variable=magnet_var
         )
-        chk_magnet.pack(pady=(0, 8))
+        chk_magnet.pack(pady=(0, 6))
 
-        lbl_cuts = ctk.CTkLabel(rec_win, text="Aufgenommene Beats: 0", font=("Arial", 18, "bold"), text_color="yellow")
-        lbl_cuts.pack(pady=3)
+        lbl_cuts = ctk.CTkLabel(rec_win, text="Aufgenommene Beats: 0", font=("Arial", 17, "bold"), text_color="yellow")
+        lbl_cuts.pack(pady=2)
 
         lbl_time = ctk.CTkLabel(rec_win, text="Zeit: 0.0s / 0.0s", font=("Arial", 12), text_color="gray")
-        lbl_time.pack(pady=2)
+        lbl_time.pack(pady=1)
+
+        # --- Latenz-Kalibrierung -------------------------------------------------
+        lat_frame = ctk.CTkFrame(rec_win, fg_color="transparent")
+        lat_frame.pack(fill="x", padx=18, pady=(6, 2))
+
+        latency_var = ctk.DoubleVar(value=self.get_manual_latency_ms())
+        lbl_latency = ctk.CTkLabel(
+            lat_frame,
+            text=f"Latenz-Korrektur: {self.get_manual_latency_ms():.0f} ms",
+            width=190, anchor="w", font=("Arial", 11, "bold")
+        )
+        lbl_latency.pack(side="left")
+
+        def _latency_cb(v):
+            lbl_latency.configure(text=f"Latenz-Korrektur: {v:.0f} ms")
+
+        self.slider_manual_latency = ctk.CTkSlider(
+            lat_frame, from_=0, to=400, variable=latency_var,
+            command=_latency_cb
+        )
+        self.slider_manual_latency.set(self.get_manual_latency_ms())
+        self.slider_manual_latency.pack(side="left", fill="x", expand=True, padx=8)
+
+        def _apply_latency(v):
+            self.set_manual_latency_ms(float(v))
+
+        self.slider_manual_latency.configure(command=lambda v: (_latency_cb(v), _apply_latency(v)))
+
+        def _open_calibration():
+            def _done(value):
+                latency_var.set(value)
+                self.slider_manual_latency.set(value)
+                _latency_cb(value)
+                self.set_manual_latency_ms(value)
+
+            self.run_latency_calibration(rec_win, current_ms=self.get_manual_latency_ms(), on_result=_done)
+
+        ctk.CTkButton(
+            lat_frame, text="Kalibrieren", command=_open_calibration,
+            fg_color="#7c3aed", hover_color="#5b21b6", width=110, height=26
+        ).pack(side="right")
+
+        ctk.CTkLabel(
+            rec_win,
+            text="Deine Tastatur, Soundkarte und der Monitor bringen alle eigene Verzoegerung mit.\n"
+                 "Einmal kalibrieren - danach sitzen alle manuellen Cuts automatisch auf dem Beat.",
+            font=("Arial", 10), text_color="#94a3b8", justify="center"
+        ).pack(pady=(0, 4))
+
+        lbl_tap_feedback = ctk.CTkLabel(rec_win, text="", font=("Consolas", 12, "bold"), text_color="#475569")
+        lbl_tap_feedback.pack(pady=2)
+
+        lbl_grid_hint = ctk.CTkLabel(rec_win, text="", font=("Arial", 11), text_color="#475569")
+        lbl_grid_hint.pack(pady=(0, 2))
 
         try:
             pygame.mixer.music.load(master_audio_wav)
@@ -2605,22 +2967,41 @@ class EditMakerApp(ctk.CTk):
             self.show_error("Fehler", f"Pygame Audio-Ladefehler:\n{e}")
             rec_win.destroy()
             shutil.rmtree(temp_dir, ignore_errors=True)
-            self.btn_generate.configure(state="normal")
-            self.btn_cancel.configure(state="disabled")
+            self._set_render_buttons(False)
             return
 
         is_playing = False
         start_perf_time = 0.0
+        onsets_arr = np.array(detected_onsets) if len(detected_onsets) > 0 else None
 
         def record_cut(event=None):
             nonlocal is_playing, start_perf_time
             if not is_playing:
                 return
+            latency = float(latency_var.get()) / 1000.0
             raw_time = time.perf_counter() - start_perf_time
-            compensated_time = max(0.01, raw_time - 0.07)
+            compensated_time = raw_time - latency
+
+            if onsets_arr is not None and len(onsets_arr) > 0:
+                nearest = float(onsets_arr[int(np.argmin(np.abs(onsets_arr - compensated_time)))])
+                err_ms = (compensated_time - nearest) * 1000.0
+                if abs(err_ms) < 35:
+                    color = "#22c55e"
+                elif abs(err_ms) < 90:
+                    color = "#facc15"
+                else:
+                    color = "#ef4444"
+                lbl_tap_feedback.configure(
+                    text=f"Tap: {err_ms:+.0f} ms vom Beat", text_color=color
+                )
+            else:
+                lbl_tap_feedback.configure(text="Tap erfasst", text_color="#facc15")
+
             if 0.05 < compensated_time < total_duration:
                 self.manual_times.append(compensated_time)
                 lbl_cuts.configure(text=f"Aufgenommene Beats: {len(self.manual_times)}")
+            else:
+                lbl_tap_feedback.configure(text="Tap ausserhalb des Auswahlbereichs", text_color="#ef4444")
 
         for key in ("<space>", "<Left>", "<Right>", "<Up>", "<Down>"):
             rec_win.bind(key, record_cut)
@@ -2631,6 +3012,19 @@ class EditMakerApp(ctk.CTk):
             if is_playing:
                 elapsed = time.perf_counter() - start_perf_time
                 lbl_time.configure(text=f"Zeit: {min(elapsed, total_duration):.1f}s / {total_duration:.1f}s")
+                if onsets_arr is not None and len(onsets_arr) > 0:
+                    pos = elapsed - float(latency_var.get()) / 1000.0
+                    idx = int(np.searchsorted(onsets_arr, pos))
+                    nxt = onsets_arr[idx] if idx < len(onsets_arr) else None
+                    prv = onsets_arr[idx - 1] if idx - 1 >= 0 else None
+                    cands = [c for c in (nxt, prv) if c is not None]
+                    if cands:
+                        dist = min(abs(pos - c) for c in cands)
+                        near = (nxt is not None and abs(pos - nxt) <= abs(pos - prv)) if prv is not None else True
+                        lbl_grid_hint.configure(
+                            text=f"{'Nächster' if near else 'Letzter'} Beat in {dist * 1000:.0f} ms",
+                            text_color="#38bdf8" if dist < 0.12 else "#475569"
+                        )
                 if elapsed >= total_duration:
                     on_close()
                     return
@@ -2646,11 +3040,12 @@ class EditMakerApp(ctk.CTk):
             update_playback_clock()
 
         btn_start = ctk.CTkButton(rec_win, text="Aufnahme Starten", command=start_play, font=("Arial", 15, "bold"), height=40)
-        btn_start.pack(pady=10)
+        btn_start.pack(pady=8)
 
         def on_close():
             nonlocal is_playing
             is_playing = False
+            self.set_manual_latency_ms(float(latency_var.get()))
             try:
                 pygame.mixer.music.stop()
                 pygame.mixer.music.unload()
@@ -2659,19 +3054,24 @@ class EditMakerApp(ctk.CTk):
             rec_win.destroy()
 
             final_beats = []
+            snapped = 0
+            loose = 0
             if len(self.manual_times) > 0:
                 raw_sorted = sorted(list(set(self.manual_times)))
-                if magnet_var.get() and len(detected_onsets) > 0:
-                    onsets_arr = np.array(detected_onsets)
+                if magnet_var.get() and onsets_arr is not None and len(onsets_arr) > 0:
+                    snap_window = float(np.clip(float(latency_var.get()) / 1000.0 * 0.8 + 0.06, 0.06, 0.16))
                     for tap in raw_sorted:
                         diffs = np.abs(onsets_arr - tap)
                         nearest_idx = int(np.argmin(diffs))
-                        if diffs[nearest_idx] <= 0.22:
+                        if diffs[nearest_idx] <= snap_window:
                             final_beats.append(float(onsets_arr[nearest_idx]))
+                            snapped += 1
                         else:
                             final_beats.append(float(tap))
+                            loose += 1
                 else:
                     final_beats = raw_sorted
+                    loose = len(raw_sorted)
 
                 final_beats = sorted(list(set(final_beats)))
                 if final_beats[0] > 0.1:
@@ -2682,7 +3082,10 @@ class EditMakerApp(ctk.CTk):
                 if final_beats[-1] < total_duration:
                     final_beats.append(total_duration)
 
-                self.set_status("Generiere Video aus manuellen Schnitten...", 0.1)
+                self.set_status(
+                    f"Generiere Video aus {len(final_beats) - 2} manuellen Schnitten "
+                    f"({snapped} am Beat eingerastet, {loose} frei)...", 0.1
+                )
                 render_settings = self.collect_render_settings()
                 threading.Thread(
                     target=self.generate_edit,
@@ -2692,8 +3095,8 @@ class EditMakerApp(ctk.CTk):
             else:
                 shutil.rmtree(temp_dir, ignore_errors=True)
                 self.set_status("Aufnahme abgebrochen (keine Schnitte erfasst).", 0.0)
-                self.btn_generate.configure(state="normal")
-                self.btn_cancel.configure(state="disabled")
+                self._set_render_buttons(False)
+
 
         rec_win.protocol("WM_DELETE_WINDOW", on_close)
 
