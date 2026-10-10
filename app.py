@@ -6,6 +6,7 @@ import cv2
 from moviepy.editor import VideoFileClip, AudioFileClip, concatenate_videoclips, CompositeVideoClip, ColorClip, vfx, ImageClip
 import os
 import threading
+import queue
 import random
 import traceback
 import time
@@ -110,22 +111,25 @@ def _build_vignette_mask(w, h):
     vig_u8 = np.clip(vig * 255.0, 0, 255).astype(np.uint8)
     return cv2.merge([vig_u8, vig_u8, vig_u8])
 
-def ai_detect_beat_drop(y, sr, total_dur):
+def ai_find_drop_candidates(y, sr, total_dur, max_candidates=8, min_gap=1.5):
     """
-    KI-basierte Struktur-Analyse & Beat-Drop Erkennung (Change-Point Detection).
+    KI-Drop-Kandidaten-Analyse fuer einen ausgewaehlten Audio-Bereich.
 
     Kandidaten-Punkte kommen aus zwei Quellen:
       1. Agglomerative Segmentierung (Chroma-CQT + MFCC) -> musikalische Abschnitte
-      2. Steile Energiesprünge im gleitenden Mehrband-Profil
+      2. Steile Energiespruenge im gleitenden Mehrband-Profil
 
     Bewertet wird jeder Kandidat als Energie-Sprung ueber die Grenze hinweg
-    (RMS, Sub-Bass 30-160 Hz, Air 4-11 kHz). Der Drop ist die Grenze, die in den
-    lautesten nachfolgenden Abschnitt fuehrt - nicht die mit dem groessten
-    relativen Sprung. Beginnt der Track mit einer stillen Intro, gewinnt der
-    erste echte Drop (Intro-Regel).
+    (RMS, Sub-Bass 30-160 Hz, Air 4-11 kHz). Der beste Drop ist die Grenze,
+    die in den lautesten nachfolgenden Abschnitt fuehrt - nicht die mit dem
+    groessten relativen Sprung. Beginnt der Bereich mit einer stillen Intro,
+    gewinnt der erste echte Drop (Intro-Regel).
+
+    Rueckgabe: Liste von Dicts (bestes zuerst) mit time, score, jump,
+    before, after, is_best, intro_promoted.
     """
     if total_dur < 3.5:
-        return 0.0
+        return []
 
     try:
         hop = 1024
@@ -148,13 +152,13 @@ def ai_detect_beat_drop(y, sr, total_dur):
 
         p_rms, p_sub, p_air = _band(rms), _band(band_sub), _band(band_air)
 
-        candidates = set()
+        raw_candidates = set()
         try:
             chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop)
             mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13, hop_length=hop)
             n_clusters = max(3, min(8, int(total_dur // 7)))
             bounds = librosa.segment.agglomerative(np.vstack([chroma, mfcc]), n_clusters)
-            candidates.update(
+            raw_candidates.update(
                 round(float(b), 2)
                 for b in librosa.frames_to_time(bounds, sr=sr, hop_length=hop)
             )
@@ -166,12 +170,12 @@ def ai_detect_beat_drop(y, sr, total_dur):
             b_r = float(np.mean(p_rms[i:i + 9]))
             a_s = float(np.mean(p_sub[i - 4:i + 5]))
             b_s = float(np.mean(p_sub[i:i + 9]))
-            if b_r > a_r * 1.25 and b_s > a_s * 1.12:
-                candidates.add(round(float(frames_t[i]), 2))
+            if b_r > a_r * 1.15 and b_s > a_s * 1.05:
+                raw_candidates.add(round(float(frames_t[i]), 2))
 
-        candidates = sorted(c for c in candidates if 1.2 < c < total_dur * 0.90)
-        if not candidates:
-            return 0.0
+        raw_candidates = sorted(c for c in raw_candidates if 1.2 < c < total_dur * 0.90)
+        if not raw_candidates:
+            return []
 
         win = max(6, int(sr / hop * 1.2))
 
@@ -191,41 +195,127 @@ def ai_detect_beat_drop(y, sr, total_dur):
             before = pre_r + 0.45 * pre_s + 0.15 * pre_a
             return jump, after, before
 
-        valid = []
-        best = None
-        for c in candidates:
+        scored = []
+        for c in raw_candidates:
             jump, after, before = _measure(c)
-            if jump < 0.50:
+            if jump < 0.30:
                 continue
-            if after <= before * 1.05 or after < 0.45:
+            if after <= before * 1.03 or after < 0.35:
                 continue
-            valid.append(c)
-            level = after - 0.35 * before
-            if best is None or level > best[0]:
-                best = (level, c)
+            scored.append({
+                "time": c,
+                "jump": jump,
+                "after": after,
+                "before": before,
+                "level": after - 0.35 * before,
+            })
 
-        if best is None:
-            return 0.0
+        if not scored:
+            return []
 
-        drop_t = best[1]
+        scored.sort(key=lambda d: d["time"])
 
-        if valid:
-            first = valid[0]
-            i_first = int(np.searchsorted(frames_t, first))
-            pre_intro = _window_mean(p_rms, max(0, i_first - 2 * win), max(1, i_first))
-            if pre_intro < 0.35:
-                drop_t = first
+        def _merge(items, gap, key):
+            """Cluster zusammenfassen; Cluster-Vertreter ist der mit dem
+            hoechsten key. Die Reihenfolge bleibt zeitlich sortiert."""
+            out = []
+            for item in sorted(items, key=lambda d: d["time"]):
+                if out and (item["time"] - out[-1]["time"]) < gap:
+                    if key(item) > key(out[-1]):
+                        out[-1] = item
+                    continue
+                out.append(item)
+            return out
 
-        idx = int(np.searchsorted(frames_t, drop_t))
-        lo, hi = max(0, idx - 6), min(n_frames, idx + 7)
-        attack = 0.6 * p_sub[lo:hi] + 0.4 * p_rms[lo:hi]
-        if len(attack) > 0:
-            drop_t = float(frames_t[lo + int(np.argmax(attack))])
+        # Strikte Definition = echte Drop-Kandidaten (bestimmt den Gewinner)
+        strict = [d for d in scored
+                  if d["jump"] >= 0.50 and d["after"] > d["before"] * 1.05 and d["after"] >= 0.45]
+        strict_merged = _merge(strict, min_gap, lambda d: d["level"])
 
-        return float(drop_t)
+        # Erweiterte Liste = auch schwächere Uebergaenge, fuer Alternativen
+        extended = _merge(scored, 1.2, lambda d: d["jump"])
+
+        pool = list(strict_merged)
+        for item in extended:
+            if any(abs(item["time"] - existing["time"]) < 1.0 for existing in pool):
+                continue
+            pool.append(item)
+        pool.sort(key=lambda d: d["time"])
+
+        if not pool:
+            return []
+
+        # Intro-Regel: beginnt der Bereich still, gewinnt der ERSTE Kandidat.
+        # Wird bewusst aus der ungemergten strikten Liste genommen (nicht aus
+        # strict_merged) - sonst verschiebt das Cluster-Merge den Gewinner um
+        # mehrere Hundertstel Sekunden nach hinten.
+        intro_promoted = False
+        best_item = None
+        if strict:
+            first_strict = strict[0]
+            fi = int(np.searchsorted(frames_t, first_strict["time"]))
+            if _window_mean(p_rms, max(0, fi - 2 * win), max(1, fi)) < 0.35:
+                intro_promoted = True
+                best_item = next(
+                    (d for d in pool if abs(d["time"] - first_strict["time"]) < 0.4),
+                    first_strict
+                )
+                if best_item not in pool:
+                    pool.append(best_item)
+
+        for item in pool:
+            item["raw_time"] = item["time"]
+            item["time"] = snap_candidate_to_transient(
+                item["time"], p_sub, p_rms, frames_t
+            )
+
+        pool.sort(key=lambda d: d["time"])
+
+        if best_item is None:
+            best_idx = int(np.argmax([d["level"] for d in pool]))
+        else:
+            best_idx = next((i for i, d in enumerate(pool) if d is best_item), 0)
+
+        # Besten zuerst: Intro-Regel und Level-Ranking duerfen nicht
+        # auseinanderlaufen, sonst zeigt die UI einen anderen als den benutzten.
+        best = pool[best_idx]
+        rest = [d for i, d in enumerate(pool) if i != best_idx]
+        rest.sort(key=lambda d: -d["level"])
+        ranked = [best] + rest
+
+        top_level = ranked[0]["level"] or 1.0
+        for idx, item in enumerate(ranked):
+            item["is_best"] = (idx == 0)
+            item["intro_promoted"] = bool(intro_promoted and idx == 0)
+            item["confidence"] = float(max(0.0, min(1.0, item["level"] / top_level)))
+
+        return ranked[:max_candidates]
     except Exception as e:
-        print(f"[AI Audio Error] {e}")
-        return 0.0
+        print(f"[AI Drop Candidate Error] {e}")
+        return []
+
+
+def snap_candidate_to_transient(t_cand, spec_p, rms_p, frames_t, radius_frames=6):
+    """Zieht einen Kandidaten auf den staerksten Attack im Fenster."""
+    try:
+        idx = int(np.searchsorted(frames_t, t_cand))
+        lo = max(0, idx - radius_frames)
+        hi = min(len(frames_t), idx + radius_frames + 1)
+        if hi <= lo:
+            return float(t_cand)
+        strength = 0.6 * spec_p[lo:hi] + 0.4 * rms_p[lo:hi]
+        return float(frames_t[lo + int(np.argmax(strength))])
+    except Exception:
+        return float(t_cand)
+
+
+def ai_detect_beat_drop(y, sr, total_dur):
+    """
+    KI-basierte Struktur-Analyse & Beat-Drop Erkennung (Change-Point Detection).
+    Liefert nur den besten Kandidaten; see ai_find_drop_candidates fuer Details.
+    """
+    found = ai_find_drop_candidates(y, sr, total_dur, max_candidates=1)
+    return float(found[0]["time"]) if found else 0.0
 
 
 def snap_beats_to_transients(beat_times, onset_env, sr, hop=512, max_shift=0.06):
@@ -701,6 +791,8 @@ class EditMakerApp(ctk.CTk):
         self._build_ui()
         self._last_state = self.capture_full_state()
         self._register_history_traces()
+        self._ui_queue = queue.Queue()
+        self.after(40, self._drain_ui_queue)
 
     def _load_presets_from_disk(self):
         presets = dict(DEFAULT_PRESETS)
@@ -760,192 +852,230 @@ class EditMakerApp(ctk.CTk):
     # UI Building
     # =====================================================================
     def _build_ui(self):
-        self.main_container = ctk.CTkScrollableFrame(self)
-        self.main_container.pack(fill="both", expand=True, padx=15, pady=12)
+        """
+        Layout: Kopfleiste -> Profilleiste -> zwei scrollende Spalten ->
+        fixierte Render-Leiste am unteren Rand (immer sichtbar).
+        """
+        self.geometry("1460x940")
+        self.minsize(1180, 720)
 
-        # 1. Header
-        lbl_title = ctk.CTkLabel(
-            self.main_container,
-            text="Auto Beat-Sync Edit Maker",
-            font=("Arial", 26, "bold")
+        self.root_container = ctk.CTkFrame(self, fg_color="transparent")
+        self.root_container.pack(fill="both", expand=True, padx=14, pady=(12, 10))
+
+        self._build_header(self.root_container)
+        self._build_profile_bar(self.root_container)
+
+        body = ctk.CTkFrame(self.root_container, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+        body.grid_columnconfigure(0, weight=1, uniform="cols")
+        body.grid_columnconfigure(1, weight=1, uniform="cols")
+        body.grid_rowconfigure(0, weight=1)
+
+        self.column_left = ctk.CTkScrollableFrame(
+            body, corner_radius=12, scrollbar_button_color="#334155",
+            fg_color="#0f172a"
         )
-        lbl_title.pack(pady=(4, 2))
-        
-        lbl_sub = ctk.CTkLabel(
-            self.main_container,
-            text="Pro Studio Engine | Multi-Band Transient Sync | 60 FPS | OpenCV Hardware-Beschleunigung",
-            text_color="#38bdf8",
-            font=("Arial", 12)
+        self.column_left.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
+
+        self.column_right = ctk.CTkScrollableFrame(
+            body, corner_radius=12, scrollbar_button_color="#334155",
+            fg_color="#0f172a"
         )
-        lbl_sub.pack(pady=(0, 10))
+        self.column_right.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
 
-        # Profile & Preset Management Frame
-        profile_frame = ctk.CTkFrame(self.main_container)
-        profile_frame.pack(fill="x", pady=5)
+        self._build_media_section(self.column_left)
+        self._build_audio_section(self.column_left)
+        self._build_sync_section(self.column_left)
+        self._build_format_section(self.column_left)
 
-        header_prof = ctk.CTkFrame(profile_frame, fg_color="transparent")
-        header_prof.pack(fill="x", padx=12, pady=(8, 2))
-        ctk.CTkLabel(header_prof, text="Profile & Presets (Speichern & Laden)", font=("Arial", 14, "bold")).pack(side="left")
+        self._build_audio_mix_section(self.column_right)
+        self._build_effects_section(self.column_right)
+        self._build_overlay_section(self.column_right)
 
-        row_prof = ctk.CTkFrame(profile_frame, fg_color="transparent")
-        row_prof.pack(fill="x", padx=12, pady=(3, 8))
+        self._build_footer(self.root_container)
 
-        ctk.CTkLabel(row_prof, text="Profil:").pack(side="left", padx=(0, 6))
+    # -----------------------------------------------------------------
+    # Kopfleiste
+    # -----------------------------------------------------------------
+    def _build_header(self, parent):
+        header = ctk.CTkFrame(parent, corner_radius=12, fg_color="#111c33")
+        header.pack(fill="x", pady=(0, 9))
+
+        left = ctk.CTkFrame(header, fg_color="transparent")
+        left.pack(side="left", padx=16, pady=10)
+
+        ctk.CTkLabel(
+            left, text="Auto Beat-Sync Edit Maker",
+            font=("Arial", 22, "bold")
+        ).pack(anchor="w")
+
+        ctk.CTkLabel(
+            left,
+            text="Pro Studio Engine  |  Multi-Band Transient Sync  |  ML Beat-Drop  |  60 FPS  |  OpenCV",
+            text_color="#38bdf8", font=("Arial", 11)
+        ).pack(anchor="w")
+
+        right = ctk.CTkFrame(header, fg_color="transparent")
+        right.pack(side="right", padx=16, pady=10)
+
+        ctk.CTkLabel(
+            right, text="Undo / Redo", font=("Arial", 10), text_color="#94a3b8"
+        ).pack(anchor="e", pady=(0, 3))
+
+        hist_row = ctk.CTkFrame(right, fg_color="transparent")
+        hist_row.pack(anchor="e")
+
+        self.btn_undo = ctk.CTkButton(
+            hist_row, text="Undo", command=self.undo_action, width=80, height=28,
+            fg_color="#334155", hover_color="#475569"
+        )
+        self.btn_undo.pack(side="left", padx=3)
+
+        self.btn_redo = ctk.CTkButton(
+            hist_row, text="Redo", command=self.redo_action, width=80, height=28,
+            fg_color="#334155", hover_color="#475569"
+        )
+        self.btn_redo.pack(side="left", padx=3)
+
+    # -----------------------------------------------------------------
+    # Profil-/Preset-Leiste (volle Breite, immer sichtbar)
+    # -----------------------------------------------------------------
+    def _build_profile_bar(self, parent):
+        profile_frame = ctk.CTkFrame(parent, corner_radius=12, fg_color="#111c33")
+        profile_frame.pack(fill="x", pady=(0, 9))
+
+        row = ctk.CTkFrame(profile_frame, fg_color="transparent")
+        row.pack(fill="x", padx=14, pady=8)
+
+        ctk.CTkLabel(row, text="Profil", font=("Arial", 13, "bold")).pack(side="left", padx=(0, 8))
+
         self.preset_names = list(self.all_presets.keys())
         self.profile_var = ctk.StringVar(value=self.preset_names[0] if self.preset_names else "Standard")
         self.combo_profile = ctk.CTkComboBox(
-            row_prof,
-            values=self.preset_names,
-            variable=self.profile_var,
-            command=self.on_profile_selected,
-            width=230
+            row, values=self.preset_names, variable=self.profile_var,
+            command=self.on_profile_selected, width=260
         )
-        self.combo_profile.pack(side="left", padx=4)
+        self.combo_profile.pack(side="left", padx=(0, 8))
 
-        self.btn_save_profile = ctk.CTkButton(
-            row_prof,
-            text="Profil speichern",
-            command=self.save_current_as_profile,
-            fg_color="#1f8a4c",
-            hover_color="#176b3b",
-            width=120
-        )
-        self.btn_save_profile.pack(side="left", padx=4)
-
-        self.btn_load_json = ctk.CTkButton(
-            row_prof,
-            text="JSON laden",
-            command=self.import_profile_json,
-            fg_color="#2b719e",
-            hover_color="#1f5375",
-            width=90
-        )
-        self.btn_load_json.pack(side="left", padx=4)
-
-        self.btn_export_json = ctk.CTkButton(
-            row_prof,
-            text="Export",
-            command=self.export_profile_json,
-            fg_color="#444444",
-            hover_color="#555555",
-            width=75
-        )
-        self.btn_export_json.pack(side="left", padx=4)
-
-        self.btn_delete_prof = ctk.CTkButton(
-            row_prof,
-            text="Loeschen",
-            command=self.delete_current_profile,
-            fg_color="#8b1e1e",
-            hover_color="#631414",
-            width=75
-        )
-        self.btn_delete_prof.pack(side="left", padx=4)
-
-        self.btn_undo = ctk.CTkButton(
-            row_prof, text="Undo", command=self.undo_action,
-            fg_color="#334155", hover_color="#475569", width=65
-        )
-        self.btn_undo.pack(side="right", padx=4)
-
-        self.btn_redo = ctk.CTkButton(
-            row_prof, text="Redo", command=self.redo_action,
-            fg_color="#334155", hover_color="#475569", width=65
-        )
-        self.btn_redo.pack(side="right", padx=4)
-
-        self.btn_load_project = ctk.CTkButton(
-            row_prof, text="Projekt laden", command=self.load_project,
-            fg_color="#1f6f8a", hover_color="#165266", width=115
-        )
-        self.btn_load_project.pack(side="right", padx=4)
+        ctk.CTkLabel(
+            row, text="Projekt", font=("Arial", 13, "bold")
+        ).pack(side="left", padx=(22, 8))
 
         self.btn_save_project = ctk.CTkButton(
-            row_prof, text="Projekt speichern", command=self.save_project,
-            fg_color="#1f8a4c", hover_color="#176b3b", width=120
+            row, text="Speichern", command=self.save_project,
+            fg_color="#1f8a4c", hover_color="#176b3b", width=110, height=30
         )
-        self.btn_save_project.pack(side="right", padx=4)
+        self.btn_save_project.pack(side="left", padx=3)
 
-        # 2. Media Selection Frame
-        media_frame = ctk.CTkFrame(self.main_container)
-        media_frame.pack(fill="x", pady=5)
+        self.btn_load_project = ctk.CTkButton(
+            row, text="Laden", command=self.load_project,
+            fg_color="#1f6f8a", hover_color="#165266", width=90, height=30
+        )
+        self.btn_load_project.pack(side="left", padx=3)
+
+        ctk.CTkLabel(
+            row, text="Preset", font=("Arial", 13, "bold")
+        ).pack(side="left", padx=(22, 8))
+
+        self.btn_save_profile = ctk.CTkButton(
+            row, text="Speichern", command=self.save_current_as_profile,
+            fg_color="#1f8a4c", hover_color="#176b3b", width=110, height=30
+        )
+        self.btn_save_profile.pack(side="left", padx=3)
+
+        self.btn_load_json = ctk.CTkButton(
+            row, text="JSON laden", command=self.import_profile_json,
+            fg_color="#2b719e", hover_color="#1f5375", width=100, height=30
+        )
+        self.btn_load_json.pack(side="left", padx=3)
+
+        self.btn_export_json = ctk.CTkButton(
+            row, text="Export", command=self.export_profile_json,
+            fg_color="#444444", hover_color="#555555", width=80, height=30
+        )
+        self.btn_export_json.pack(side="left", padx=3)
+
+        self.btn_delete_prof = ctk.CTkButton(
+            row, text="Loeschen", command=self.delete_current_profile,
+            fg_color="#8b1e1e", hover_color="#631414", width=90, height=30
+        )
+        self.btn_delete_prof.pack(side="left", padx=3)
+
+    # -----------------------------------------------------------------
+    # 1. Medien
+    # -----------------------------------------------------------------
+    def _build_media_section(self, parent):
+        media_frame = ctk.CTkFrame(parent, corner_radius=12)
+        media_frame.pack(fill="x", pady=(0, 9))
 
         header_media = ctk.CTkFrame(media_frame, fg_color="transparent")
-        header_media.pack(fill="x", padx=12, pady=(10, 4))
+        header_media.pack(fill="x", padx=14, pady=(10, 2))
 
-        ctk.CTkLabel(header_media, text="1. Medien (Videos & Bilder)", font=("Arial", 14, "bold")).pack(side="left")
+        ctk.CTkLabel(
+            header_media, text="1. Medien (Videos & Bilder)", font=("Arial", 14, "bold")
+        ).pack(side="left")
         self.lbl_videos_count = ctk.CTkLabel(header_media, text="0 Dateien ausgewählt", text_color="gray")
         self.lbl_videos_count.pack(side="right")
 
         btn_row_media = ctk.CTkFrame(media_frame, fg_color="transparent")
-        btn_row_media.pack(fill="x", padx=12, pady=4)
+        btn_row_media.pack(fill="x", padx=14, pady=4)
 
         self.btn_select_videos = ctk.CTkButton(
-            btn_row_media,
-            text="Clips / Bilder wählen",
-            command=self.select_videos,
-            width=180
+            btn_row_media, text="Clips / Bilder wählen", command=self.select_videos, width=170, height=32
         )
-        self.btn_select_videos.pack(side="left", padx=(0, 10))
+        self.btn_select_videos.pack(side="left", padx=(0, 8))
 
         self.btn_clear_videos = ctk.CTkButton(
-            btn_row_media,
-            text="Zurücksetzen",
-            command=self.clear_videos,
-            fg_color="#444444",
-            hover_color="#555555",
-            width=100
+            btn_row_media, text="Zurücksetzen", command=self.clear_videos,
+            fg_color="#444444", hover_color="#555555", width=110, height=32
         )
-        self.btn_clear_videos.pack(side="left", padx=5)
+        self.btn_clear_videos.pack(side="left", padx=(0, 10))
 
         self.shuffle_var = ctk.BooleanVar(value=True)
         self.chk_shuffle = ctk.CTkCheckBox(
-            btn_row_media,
-            text="Zufällige Reihenfolge (Shuffle)",
-            variable=self.shuffle_var
+            btn_row_media, text="Zufällige Reihenfolge", variable=self.shuffle_var
         )
-        self.chk_shuffle.pack(side="right", padx=5)
+        self.chk_shuffle.pack(side="left", padx=5)
 
-        self.media_listbox = ctk.CTkTextbox(media_frame, height=65, font=("Consolas", 11), activate_scrollbars=True)
-        self.media_listbox.pack(fill="x", padx=12, pady=(4, 10))
-        self.media_listbox.insert("1.0", "Noch keine Dateien gewählt. Unterstützt MP4, MOV, MKV, AVI, PNG, JPG, WEBP...")
+        self.media_listbox = ctk.CTkTextbox(
+            media_frame, height=90, font=("Consolas", 11), activate_scrollbars=True
+        )
+        self.media_listbox.pack(fill="x", padx=14, pady=(2, 10))
+        self.media_listbox.insert("1.0", "Noch keine Dateien gewählt.\nUnterstützt MP4, MOV, MKV, AVI, PNG, JPG, WEBP")
         self.media_listbox.configure(state="disabled")
 
-        # 3. Audio Selection & Trim Frame
-        audio_frame = ctk.CTkFrame(self.main_container)
-        audio_frame.pack(fill="x", pady=5)
+    # -----------------------------------------------------------------
+    # 2. Musik
+    # -----------------------------------------------------------------
+    def _build_audio_section(self, parent):
+        audio_frame = ctk.CTkFrame(parent, corner_radius=12)
+        audio_frame.pack(fill="x", pady=(0, 9))
 
         header_audio = ctk.CTkFrame(audio_frame, fg_color="transparent")
-        header_audio.pack(fill="x", padx=12, pady=(10, 4))
+        header_audio.pack(fill="x", padx=14, pady=(10, 2))
 
-        ctk.CTkLabel(header_audio, text="2. Musik (Beat & Song)", font=("Arial", 14, "bold")).pack(side="left")
+        ctk.CTkLabel(
+            header_audio, text="2. Musik (Beat & Song)", font=("Arial", 14, "bold")
+        ).pack(side="left")
         self.lbl_audio_status = ctk.CTkLabel(header_audio, text="Kein Song gewählt", text_color="gray")
         self.lbl_audio_status.pack(side="right")
 
         btn_row_audio = ctk.CTkFrame(audio_frame, fg_color="transparent")
-        btn_row_audio.pack(fill="x", padx=12, pady=4)
+        btn_row_audio.pack(fill="x", padx=14, pady=4)
 
         self.btn_select_audio = ctk.CTkButton(
-            btn_row_audio,
-            text="Song auswählen",
-            command=self.select_audio,
-            width=180
+            btn_row_audio, text="Song auswählen", command=self.select_audio, width=160, height=32
         )
-        self.btn_select_audio.pack(side="left", padx=(0, 10))
+        self.btn_select_audio.pack(side="left", padx=(0, 8))
 
         self.btn_audio_preview = ctk.CTkButton(
-            btn_row_audio,
-            text="Vorhören",
-            command=self.toggle_audio_preview,
-            fg_color="#2b719e",
-            hover_color="#1f5375",
-            width=110,
-            state="disabled"
+            btn_row_audio, text="Vorhören", command=self.toggle_audio_preview,
+            fg_color="#2b719e", hover_color="#1f5375", width=120, height=32, state="disabled"
         )
         self.btn_audio_preview.pack(side="left", padx=5)
 
         slider_frame = ctk.CTkFrame(audio_frame, fg_color="transparent")
-        slider_frame.pack(fill="x", padx=12, pady=(4, 10))
+        slider_frame.pack(fill="x", padx=14, pady=(4, 4))
 
         start_row = ctk.CTkFrame(slider_frame, fg_color="transparent")
         start_row.pack(fill="x", pady=2)
@@ -963,35 +1093,25 @@ class EditMakerApp(ctk.CTk):
         self.slider_end.set(0)
         self.slider_end.pack(side="right", fill="x", expand=True, padx=5)
 
-        # Waveform with beat & drop markers
         waveform_wrap = ctk.CTkFrame(audio_frame, fg_color="transparent")
-        waveform_wrap.pack(fill="x", padx=12, pady=(2, 4))
+        waveform_wrap.pack(fill="x", padx=14, pady=(2, 4))
 
         self.lbl_waveform_hint = ctk.CTkLabel(
-            waveform_wrap,
-            text="Linksklick: Start | Rechtsklick: Ende",
-            font=("Arial", 10),
-            text_color="#94a3b8"
+            waveform_wrap, text="Linksklick: Start | Rechtsklick: Ende",
+            font=("Arial", 10), text_color="#94a3b8"
         )
         self.lbl_waveform_hint.pack(side="left")
 
         self.lbl_playback_time = ctk.CTkLabel(
-            waveform_wrap,
-            text="",
-            font=("Consolas", 10, "bold"),
-            text_color="#facc15"
+            waveform_wrap, text="", font=("Consolas", 10, "bold"), text_color="#facc15"
         )
         self.lbl_playback_time.pack(side="right")
 
         self.wave_canvas = Canvas(
-            waveform_wrap,
-            height=70,
-            bg="#0b1220",
-            highlightthickness=1,
-            highlightbackground="#1e293b",
-            cursor="hand2"
+            waveform_wrap, height=78, bg="#0b1220",
+            highlightthickness=1, highlightbackground="#1e293b", cursor="hand2"
         )
-        self.wave_canvas.pack(fill="x", pady=(2, 0))
+        self.wave_canvas.pack(fill="x", pady=(2, 8))
         self.wave_canvas.bind("<Configure>", lambda e: self.draw_waveform())
         self.wave_canvas.bind("<Button-1>", self.on_waveform_click)
         self.wave_canvas.bind("<Button-3>", self.on_waveform_right_click)
@@ -1000,50 +1120,68 @@ class EditMakerApp(ctk.CTk):
         self.wave_beats = []
         self.wave_drop = 0.0
         self.wave_playhead = None
+        self.drop_candidates = []
+        self.drop_scan_offset = 0.0
+        self._candidate_win = None
 
-        # 4. Beat Detection & Pacing Frame (Multi-Band Engine)
-        sync_frame = ctk.CTkFrame(self.main_container)
-        sync_frame.pack(fill="x", pady=5)
+    # -----------------------------------------------------------------
+    # 3. Beat-Sync & Timing
+    # -----------------------------------------------------------------
+    def _build_sync_section(self, parent):
+        sync_frame = ctk.CTkFrame(parent, corner_radius=12)
+        sync_frame.pack(fill="x", pady=(0, 9))
 
-        ctk.CTkLabel(sync_frame, text="3. Beat-Sync & Multi-Band Timing", font=("Arial", 14, "bold")).pack(anchor="w", padx=12, pady=(10, 3))
+        ctk.CTkLabel(
+            sync_frame, text="3. Beat-Sync & Multi-Band Timing", font=("Arial", 14, "bold")
+        ).pack(anchor="w", padx=14, pady=(10, 3))
 
         mode_row = ctk.CTkFrame(sync_frame, fg_color="transparent")
-        mode_row.pack(fill="x", padx=12, pady=3)
+        mode_row.pack(fill="x", padx=14, pady=2)
 
         self.mode_var = ctk.StringVar(value="auto")
-        ctk.CTkRadioButton(mode_row, text="Auto Takt (Kick & Snare Transient-Sync)", variable=self.mode_var, value="auto").pack(side="left", padx=8)
-        ctk.CTkRadioButton(mode_row, text="Dynamisch (Alle Onsets)", variable=self.mode_var, value="onsets").pack(side="left", padx=8)
-        ctk.CTkRadioButton(mode_row, text="Manuell (Mit Takt-Magnet)", variable=self.mode_var, value="manual").pack(side="left", padx=8)
+        ctk.CTkRadioButton(
+            mode_row, text="Auto Takt (Kick & Snare)", variable=self.mode_var, value="auto"
+        ).pack(side="left", padx=(0, 14))
+        ctk.CTkRadioButton(
+            mode_row, text="Dynamisch (Alle Onsets)", variable=self.mode_var, value="onsets"
+        ).pack(side="left", padx=(0, 14))
+        ctk.CTkRadioButton(
+            mode_row, text="Manuell (Takt-Magnet)", variable=self.mode_var, value="manual"
+        ).pack(side="left")
 
         pace_row = ctk.CTkFrame(sync_frame, fg_color="transparent")
-        pace_row.pack(fill="x", padx=12, pady=(4, 10))
+        pace_row.pack(fill="x", padx=14, pady=2)
 
         ctk.CTkLabel(pace_row, text="Schnitt-Tempo:").pack(side="left", padx=(0, 8))
         self.pace_var = ctk.StringVar(value="1x (Jeder Takt)")
         self.combo_pace = ctk.CTkComboBox(
             pace_row,
             values=["1x (Jeder Takt)", "2x Schnell (Halber Takt)", "0.5x Entspannt (Doppel-Takt)"],
-            variable=self.pace_var,
-            width=210
+            variable=self.pace_var, width=200
         )
-        self.combo_pace.pack(side="left", padx=5)
+        self.combo_pace.pack(side="left", padx=(0, 14))
+
+        ctk.CTkLabel(pace_row, text="Framerate:").pack(side="left", padx=(0, 6))
+        self.fps_var = ctk.IntVar(value=60)
+        ctk.CTkRadioButton(pace_row, text="60", variable=self.fps_var, value=60).pack(side="left", padx=(0, 8))
+        ctk.CTkRadioButton(pace_row, text="30", variable=self.fps_var, value=30).pack(side="left")
+
+        opt_row = ctk.CTkFrame(sync_frame, fg_color="transparent")
+        opt_row.pack(fill="x", padx=14, pady=(2, 4))
 
         self.ai_audio_analysis_var = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(
-            pace_row,
-            text="KI-Struktur- & Drum-Isolation (ML-Cluster)",
-            variable=self.ai_audio_analysis_var
-        ).pack(side="left", padx=(15, 5))
+            opt_row, text="KI-Struktur (ML-Cluster)",
+            variable=self.ai_audio_analysis_var, font=("Arial", 11)
+        ).pack(side="left", padx=(0, 16))
 
         self.snap_jitter_var = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(
-            pace_row,
-            text="Jitter-Korrektur (Beats auf Transients snappen)",
-            variable=self.snap_jitter_var
-        ).pack(side="left", padx=(10, 5))
+            opt_row, text="Jitter-Korrektur", variable=self.snap_jitter_var, font=("Arial", 11)
+        ).pack(side="left")
 
         preroll_row = ctk.CTkFrame(sync_frame, fg_color="transparent")
-        preroll_row.pack(fill="x", padx=12, pady=(2, 4))
+        preroll_row.pack(fill="x", padx=14, pady=2)
 
         ctk.CTkLabel(preroll_row, text="Drop-Pre-Roll / Intro:").pack(side="left", padx=(0, 8))
         self.preroll_var = ctk.StringVar(value="16 Beats davor (4 Takte)")
@@ -1057,136 +1195,156 @@ class EditMakerApp(ctk.CTk):
                 "16 Beats davor (4 Takte)",
                 "32 Beats davor (8 Takte)"
             ],
-            variable=self.preroll_var,
-            width=250
-        ).pack(side="left", padx=5)
+            variable=self.preroll_var, width=215
+        ).pack(side="left")
 
-        ctk.CTkLabel(preroll_row, text="Best-Moment-Länge:").pack(side="left", padx=(18, 8))
+        candidate_row = ctk.CTkFrame(sync_frame, fg_color="transparent")
+        candidate_row.pack(fill="x", padx=14, pady=(2, 4))
+
+        self.btn_candidates = ctk.CTkButton(
+            candidate_row, text="Drop-Kandidaten suchen", width=190, height=32,
+            fg_color="#db2777", hover_color="#9d174d",
+            command=self.scan_drop_candidates_ui
+        )
+        self.btn_candidates.pack(side="left", padx=(0, 8))
+
+        self.lbl_candidate_hint = ctk.CTkLabel(
+            candidate_row, text="KI durchsucht den Auswahlbereich nach allen Drops",
+            font=("Arial", 10), text_color="#94a3b8"
+        )
+        self.lbl_candidate_hint.pack(side="left")
+
+        best_row = ctk.CTkFrame(sync_frame, fg_color="transparent")
+        best_row.pack(fill="x", padx=14, pady=(2, 10))
+
+        ctk.CTkLabel(best_row, text="Best-Moment-Länge:").pack(side="left", padx=(0, 8))
         self.best_moment_len_var = ctk.StringVar(value="30s")
         ctk.CTkOptionMenu(
-            preroll_row,
-            values=["15s", "30s", "60s", "90s"],
-            variable=self.best_moment_len_var,
-            width=70
-        ).pack(side="left", padx=5)
+            best_row, values=["15s", "30s", "60s", "90s"], variable=self.best_moment_len_var, width=70
+        ).pack(side="left", padx=(0, 8))
 
         self.btn_best_moment = ctk.CTkButton(
-            preroll_row, text="Besten Hook finden", width=150, height=26,
+            best_row, text="Besten Hook finden", width=160, height=32,
             fg_color="#7c3aed", hover_color="#5b21b6",
             command=self.find_best_moment_ui
         )
-        self.btn_best_moment.pack(side="left", padx=(10, 0))
+        self.btn_best_moment.pack(side="left")
 
-        # 5. Format, Skalierung & Qualität
-        format_frame = ctk.CTkFrame(self.main_container)
-        format_frame.pack(fill="x", pady=5)
+    # -----------------------------------------------------------------
+    # 4. Format, Auflösung, Qualität
+    # -----------------------------------------------------------------
+    def _build_format_section(self, parent):
+        format_frame = ctk.CTkFrame(parent, corner_radius=12)
+        format_frame.pack(fill="x", pady=(0, 9))
 
-        ctk.CTkLabel(format_frame, text="4. Format, Auflösung, Qualität & FPS", font=("Arial", 14, "bold")).pack(anchor="w", padx=12, pady=(10, 3))
-        
+        ctk.CTkLabel(
+            format_frame, text="4. Format, Auflösung & Qualität", font=("Arial", 14, "bold")
+        ).pack(anchor="w", padx=14, pady=(10, 3))
+
         row_fmt = ctk.CTkFrame(format_frame, fg_color="transparent")
-        row_fmt.pack(fill="x", padx=12, pady=3)
+        row_fmt.pack(fill="x", padx=14, pady=2)
 
         ctk.CTkLabel(row_fmt, text="Format:").pack(side="left", padx=(0, 8))
-        self.orient_var = ctk.StringVar(value="original")
-        ctk.CTkRadioButton(row_fmt, text="Originalformat (Kein Zoom)", variable=self.orient_var, value="original").pack(side="left", padx=6)
-        ctk.CTkRadioButton(row_fmt, text="Hochkant (9:16)", variable=self.orient_var, value="portrait").pack(side="left", padx=6)
-        ctk.CTkRadioButton(row_fmt, text="Quer (16:9)", variable=self.orient_var, value="landscape").pack(side="left", padx=6)
+        self.orient_var = ctk.StringVar(value="portrait")
+        ctk.CTkRadioButton(row_fmt, text="Original", variable=self.orient_var, value="original").pack(side="left", padx=(0, 10))
+        ctk.CTkRadioButton(row_fmt, text="Hochkant 9:16", variable=self.orient_var, value="portrait").pack(side="left", padx=(0, 10))
+        ctk.CTkRadioButton(row_fmt, text="Quer 16:9", variable=self.orient_var, value="landscape").pack(side="left")
 
-        row_scale_fps = ctk.CTkFrame(format_frame, fg_color="transparent")
-        row_scale_fps.pack(fill="x", padx=12, pady=3)
+        row_scale = ctk.CTkFrame(format_frame, fg_color="transparent")
+        row_scale.pack(fill="x", padx=14, pady=2)
 
-        ctk.CTkLabel(row_scale_fps, text="Einpassung:").pack(side="left", padx=(0, 6))
+        ctk.CTkLabel(row_scale, text="Einpassung:").pack(side="left", padx=(0, 8))
         self.scale_mode_var = ctk.StringVar(value="fit")
-        ctk.CTkRadioButton(row_scale_fps, text="Ganzes Bild (Fit)", variable=self.scale_mode_var, value="fit").pack(side="left", padx=5)
-        ctk.CTkRadioButton(row_scale_fps, text="Vollbild (Crop)", variable=self.scale_mode_var, value="fill").pack(side="left", padx=5)
-
-        ctk.CTkLabel(row_scale_fps, text="Framerate:").pack(side="left", padx=(15, 6))
-        self.fps_var = ctk.IntVar(value=60)
-        ctk.CTkRadioButton(row_scale_fps, text="60 FPS (Flüssig)", variable=self.fps_var, value=60).pack(side="left", padx=5)
-        ctk.CTkRadioButton(row_scale_fps, text="30 FPS", variable=self.fps_var, value=30).pack(side="left", padx=5)
-
-        self.ai_reframe_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(
-            row_scale_fps,
-            text="KI-Auto-Reframe (Gesicht im 9:16-Crop halten)",
-            variable=self.ai_reframe_var
-        ).pack(side="left", padx=(15, 5))
+        ctk.CTkRadioButton(row_scale, text="Ganzes Bild (Fit)", variable=self.scale_mode_var, value="fit").pack(side="left", padx=(0, 12))
+        ctk.CTkRadioButton(row_scale, text="Vollbild (Crop)", variable=self.scale_mode_var, value="fill").pack(side="left")
 
         row_quality = ctk.CTkFrame(format_frame, fg_color="transparent")
-        row_quality.pack(fill="x", padx=12, pady=(3, 10))
+        row_quality.pack(fill="x", padx=14, pady=(2, 2))
 
-        ctk.CTkLabel(row_quality, text="Export-Qualität:").pack(side="left", padx=(0, 6))
+        ctk.CTkLabel(row_quality, text="Qualität:").pack(side="left", padx=(0, 8))
         self.quality_var = ctk.StringVar(value="High Quality (CRF 16 Studio)")
-        ctk.CTkComboBox(
+        ctk.CTkOptionMenu(
             row_quality,
             values=[
                 "High Quality (CRF 16 Studio)",
                 "Maximal (CRF 14 Glasklar)",
                 "Ultra-Fast (CRF 20 Schnell)"
             ],
-            variable=self.quality_var,
-            width=230
-        ).pack(side="left", padx=5)
+            variable=self.quality_var, width=215
+        ).pack(side="left", padx=(0, 12))
 
-        ctk.CTkLabel(row_quality, text="Auflösung:").pack(side="left", padx=(15, 6))
+        ctk.CTkLabel(row_quality, text="Auflösung:").pack(side="left", padx=(0, 8))
         self.res_var = ctk.StringVar(value="1080p (Full HD)")
-        ctk.CTkComboBox(
+        ctk.CTkOptionMenu(
             row_quality,
-            values=[
-                "1080p (Full HD)",
-                "1440p (2K Ultra Sharp)",
-                "Originalgröße der Dateien"
-            ],
-            variable=self.res_var,
-            width=180
-        ).pack(side="left", padx=5)
+            values=["1080p (Full HD)", "1440p (2K Ultra Sharp)", "Originalgröße der Dateien"],
+            variable=self.res_var, width=185
+        ).pack(side="left")
 
-        # 6. Audio-Mixing & Fade-Out
-        audio_opt_frame = ctk.CTkFrame(self.main_container)
-        audio_opt_frame.pack(fill="x", pady=5)
+        row_reframe = ctk.CTkFrame(format_frame, fg_color="transparent")
+        row_reframe.pack(fill="x", padx=14, pady=(4, 10))
 
-        ctk.CTkLabel(audio_opt_frame, text="5. Audio-Mixing & Ausblenden", font=("Arial", 14, "bold")).pack(anchor="w", padx=12, pady=(10, 3))
-        
+        self.ai_reframe_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            row_reframe, text="KI-Auto-Reframe (Gesicht im 9:16-Crop halten)",
+            variable=self.ai_reframe_var
+        ).pack(side="left")
+
+    # -----------------------------------------------------------------
+    # 5. Audio-Mixing
+    # -----------------------------------------------------------------
+    def _build_audio_mix_section(self, parent):
+        audio_opt_frame = ctk.CTkFrame(parent, corner_radius=12)
+        audio_opt_frame.pack(fill="x", pady=(0, 9))
+
+        ctk.CTkLabel(
+            audio_opt_frame, text="5. Audio-Mixing & Ausblenden", font=("Arial", 14, "bold")
+        ).pack(anchor="w", padx=14, pady=(10, 3))
+
         row_mix = ctk.CTkFrame(audio_opt_frame, fg_color="transparent")
-        row_mix.pack(fill="x", padx=12, pady=(3, 10))
+        row_mix.pack(fill="x", padx=14, pady=(2, 2))
 
         ctk.CTkLabel(row_mix, text="Original Clip-Sound:").pack(side="left", padx=(0, 8))
         self.clip_audio_var = ctk.StringVar(value="Stumm (100% Musik)")
-        ctk.CTkComboBox(
+        ctk.CTkOptionMenu(
             row_mix,
             values=["Stumm (100% Musik)", "Dezent 15% (Killsounds/SFX)", "Mittel 35% (Dialoge/SFX)"],
-            variable=self.clip_audio_var,
-            width=210
-        ).pack(side="left", padx=5)
+            variable=self.clip_audio_var, width=230
+        ).pack(side="left")
+
+        row_audio_flags = ctk.CTkFrame(audio_opt_frame, fg_color="transparent")
+        row_audio_flags.pack(fill="x", padx=14, pady=(2, 10))
 
         self.fade_out_var = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(
-            row_mix,
-            text="Sanfter Audio- & Video-Fade-Out am Ende (0.8s)",
+            row_audio_flags, text="Fade-Out am Ende (0.8s)",
             variable=self.fade_out_var
-        ).pack(side="left", padx=(15, 5))
+        ).pack(side="left", padx=(0, 18))
 
         self.auto_loudness_var = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(
-            row_mix,
-            text="Auto-Loudness (EBU R128, -14 LUFS)",
+            row_audio_flags, text="Auto-Loudness (EBU R128, -14 LUFS)",
             variable=self.auto_loudness_var
-        ).pack(side="left", padx=(10, 5))
+        ).pack(side="left")
 
-        # 7. Modern High-Impact Effects & Cinematic Grading Frame
-        effects_frame = ctk.CTkFrame(self.main_container)
-        effects_frame.pack(fill="x", pady=5)
+    # -----------------------------------------------------------------
+    # 6. Impact-Effekte
+    # -----------------------------------------------------------------
+    def _build_effects_section(self, parent):
+        effects_frame = ctk.CTkFrame(parent, corner_radius=12)
+        effects_frame.pack(fill="x", pady=(0, 9))
 
-        eff_header = ctk.CTkFrame(effects_frame, fg_color="transparent")
-        eff_header.pack(fill="x", padx=12, pady=(10, 3))
-        ctk.CTkLabel(eff_header, text="6. Professionelle Impact-Effekte & Cinematic Look", font=("Arial", 14, "bold")).pack(side="left")
+        ctk.CTkLabel(
+            effects_frame, text="6. Impact-Effekte & Cinematic Look",
+            font=("Arial", 14, "bold")
+        ).pack(anchor="w", padx=14, pady=(10, 3))
 
         preset_row = ctk.CTkFrame(effects_frame, fg_color="transparent")
-        preset_row.pack(fill="x", padx=12, pady=3)
+        preset_row.pack(fill="x", padx=14, pady=2)
 
-        ctk.CTkLabel(preset_row, text="Effekt-Stil:").pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(preset_row, text="Stil:").pack(side="left", padx=(0, 8))
         self.combo_fx_style = ctk.StringVar(value="Dynamischer Rhythmus-Flow (Abwechslungsreich)")
-        ctk.CTkComboBox(
+        ctk.CTkOptionMenu(
             preset_row,
             values=[
                 "Dynamischer Rhythmus-Flow (Abwechslungsreich)",
@@ -1194,47 +1352,48 @@ class EditMakerApp(ctk.CTk):
                 "Zufällig wechselnd (Ein Effekt pro Cut)",
                 "Dezent & Sanft (Nur weiche Übergänge)"
             ],
-            variable=self.combo_fx_style,
-            width=330
-        ).pack(side="left", padx=5)
+            variable=self.combo_fx_style, width=320
+        ).pack(side="left")
 
-        ctk.CTkLabel(preset_row, text="Impact-Rhythmus:").pack(side="left", padx=(10, 6))
+        cadence_row = ctk.CTkFrame(effects_frame, fg_color="transparent")
+        cadence_row.pack(fill="x", padx=14, pady=2)
+
+        ctk.CTkLabel(cadence_row, text="Impact-Rhythmus:").pack(side="left", padx=(0, 8))
         self.fx_cadence_var = ctk.StringVar(value="Jeder 2. Cut (Sauberer Takt)")
         ctk.CTkOptionMenu(
-            preset_row,
+            cadence_row,
             values=[
                 "Jeder Cut (Maximal)",
                 "Jeder 2. Cut (Sauberer Takt)",
                 "Jeder 4. Cut (Nur Akzente)"
             ],
-            variable=self.fx_cadence_var,
-            width=185
-        ).pack(side="left", padx=5)
+            variable=self.fx_cadence_var, width=185
+        ).pack(side="left", padx=(0, 18))
 
         self.fx_cinematic_lut = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(
-            preset_row,
-            text="Cinematic S-Curve Contrast & Color Pop",
-            variable=self.fx_cinematic_lut
-        ).pack(side="left", padx=(15, 5))
+            cadence_row, text="Cinematic LUT", variable=self.fx_cinematic_lut
+        ).pack(side="left")
 
-        # Intensity Slider Row
         intensity_row = ctk.CTkFrame(effects_frame, fg_color="transparent")
-        intensity_row.pack(fill="x", padx=12, pady=(4, 2))
+        intensity_row.pack(fill="x", padx=14, pady=(4, 2))
 
-        self.lbl_fx_intensity = ctk.CTkLabel(intensity_row, text="Effekt-Intensität: 100% (Recoil & Bloom)", width=280, anchor="w")
+        self.lbl_fx_intensity = ctk.CTkLabel(
+            intensity_row, text="Effekt-Intensität: 100%", width=170, anchor="w", font=("Arial", 11)
+        )
         self.lbl_fx_intensity.pack(side="left", padx=(0, 10))
 
         self.slider_fx_intensity = ctk.CTkSlider(
-            intensity_row,
-            from_=20, to=200,
-            command=lambda v: (self.lbl_fx_intensity.configure(text=f"Effekt-Intensität: {int(v)}% (Recoil & Bloom)"), self.note_change())
+            intensity_row, from_=20, to=200,
+            command=lambda v: (self.lbl_fx_intensity.configure(text=f"Effekt-Intensität: {int(v)}%"), self.note_change())
         )
         self.slider_fx_intensity.set(100)
-        self.slider_fx_intensity.pack(side="left", fill="x", expand=True, padx=5)
+        self.slider_fx_intensity.pack(side="left", fill="x", expand=True)
 
         eff_grid = ctk.CTkFrame(effects_frame, fg_color="transparent")
-        eff_grid.pack(fill="x", padx=12, pady=(6, 10))
+        eff_grid.pack(fill="x", padx=14, pady=(4, 10))
+        eff_grid.grid_columnconfigure(0, weight=1)
+        eff_grid.grid_columnconfigure(1, weight=1)
 
         self.fx_shake = ctk.BooleanVar(value=True)
         self.fx_bloom_flash = ctk.BooleanVar(value=True)
@@ -1245,136 +1404,137 @@ class EditMakerApp(ctk.CTk):
         self.fx_speedramp = ctk.BooleanVar(value=True)
         self.fx_bass_pulse = ctk.BooleanVar(value=False)
 
-        ctk.CTkCheckBox(eff_grid, text="Bass-Shake (Rotations-Tilt & Recoil)", variable=self.fx_shake).grid(row=0, column=0, sticky="w", padx=8, pady=3)
-        ctk.CTkCheckBox(eff_grid, text="Exposure Bloom-Flash (Highlight-Burst)", variable=self.fx_bloom_flash).grid(row=0, column=1, sticky="w", padx=8, pady=3)
-        ctk.CTkCheckBox(eff_grid, text="Punch-Zoom (Optischer Ease)", variable=self.fx_punch_zoom).grid(row=0, column=2, sticky="w", padx=8, pady=3)
-        ctk.CTkCheckBox(eff_grid, text="Radial RGB-Aberration (Linsenzerlegung)", variable=self.fx_rgb_shock).grid(row=1, column=0, sticky="w", padx=8, pady=3)
-        ctk.CTkCheckBox(eff_grid, text="Cinematic Vignette (Dunkler Randfokus)", variable=self.fx_vignette).grid(row=1, column=1, sticky="w", padx=8, pady=3)
-        ctk.CTkCheckBox(eff_grid, text="Slow Push-In (Sanfte Kamerafahrt)", variable=self.fx_slow_push).grid(row=1, column=2, sticky="w", padx=8, pady=3)
-        ctk.CTkCheckBox(eff_grid, text="Speed-Ramp (Sync-Safe Velocity)", variable=self.fx_speedramp).grid(row=2, column=0, sticky="w", padx=8, pady=3)
-        ctk.CTkCheckBox(eff_grid, text="Bass-Pulse (Full-Frame Kick-Darkening)", variable=self.fx_bass_pulse).grid(row=2, column=1, sticky="w", padx=8, pady=3)
+        boxes = [
+            (self.fx_shake, "Bass-Shake (Tilt & Recoil)"),
+            (self.fx_bloom_flash, "Exposure Bloom-Flash"),
+            (self.fx_punch_zoom, "Punch-Zoom (Optischer Ease)"),
+            (self.fx_slow_push, "Slow Push-In (Kamerafahrt)"),
+            (self.fx_rgb_shock, "Radial RGB-Aberration"),
+            (self.fx_vignette, "Cinematic Vignette"),
+            (self.fx_speedramp, "Speed-Ramp (Sync-Safe)"),
+            (self.fx_bass_pulse, "Bass-Pulse (Kick-Darkening)"),
+        ]
+        for idx, (var, label) in enumerate(boxes):
+            ctk.CTkCheckBox(
+                eff_grid, text=label, variable=var, font=("Arial", 11)
+            ).grid(row=idx // 2, column=idx % 2, sticky="w", padx=(0, 10), pady=2)
 
-        # 8. Spinning Overlay Frame
-        overlay_frame = ctk.CTkFrame(self.main_container)
-        overlay_frame.pack(fill="x", pady=5)
+    # -----------------------------------------------------------------
+    # 7. Spinning Overlay
+    # -----------------------------------------------------------------
+    def _build_overlay_section(self, parent):
+        overlay_frame = ctk.CTkFrame(parent, corner_radius=12)
+        overlay_frame.pack(fill="x", pady=(0, 9))
 
         overlay_header = ctk.CTkFrame(overlay_frame, fg_color="transparent")
-        overlay_header.pack(fill="x", padx=12, pady=(10, 4))
+        overlay_header.pack(fill="x", padx=14, pady=(10, 2))
 
         self.enable_overlay_var = ctk.BooleanVar(value=False)
         self.chk_overlay = ctk.CTkCheckBox(
-            overlay_header,
-            text="Spinning Bild-Overlay aktivieren",
-            variable=self.enable_overlay_var,
-            command=self._toggle_overlay_ui,
-            font=("Arial", 14, "bold")
+            overlay_header, text="7. Spinning Bild-Overlay", variable=self.enable_overlay_var,
+            command=self._toggle_overlay_ui, font=("Arial", 14, "bold")
         )
         self.chk_overlay.pack(side="left")
 
         self.overlay_options_frame = ctk.CTkFrame(overlay_frame, fg_color="transparent")
 
-        # Row 1: Image Selection
         row_ov1 = ctk.CTkFrame(self.overlay_options_frame, fg_color="transparent")
-        row_ov1.pack(fill="x", padx=12, pady=4)
+        row_ov1.pack(fill="x", padx=14, pady=4)
 
         self.btn_select_overlay = ctk.CTkButton(
-            row_ov1,
-            text="Overlay-Bild wählen (PNG/JPG)",
-            command=self.select_overlay_image,
-            width=220
+            row_ov1, text="Overlay-Bild wählen", command=self.select_overlay_image, width=170, height=30
         )
         self.btn_select_overlay.pack(side="left", padx=(0, 10))
 
         self.lbl_overlay_name = ctk.CTkLabel(row_ov1, text="Kein Bild ausgewählt", text_color="gray")
         self.lbl_overlay_name.pack(side="left")
 
-        # Row 2: Timing / Start-Point
         row_ov2 = ctk.CTkFrame(self.overlay_options_frame, fg_color="transparent")
-        row_ov2.pack(fill="x", padx=12, pady=4)
+        row_ov2.pack(fill="x", padx=14, pady=4)
 
-        ctk.CTkLabel(row_ov2, text="Start-Zeitpunkt:").pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(row_ov2, text="Start:").pack(side="left", padx=(0, 8))
         self.overlay_start_mode = ctk.StringVar(value="custom")
-        ctk.CTkRadioButton(row_ov2, text="Ab Beat-Drop / Sekunde", variable=self.overlay_start_mode, value="custom").pack(side="left", padx=6)
-        ctk.CTkRadioButton(row_ov2, text="Von Anfang an (0.0s)", variable=self.overlay_start_mode, value="start").pack(side="left", padx=6)
-
-        self.btn_detect_drop = ctk.CTkButton(
-            row_ov2, text="Auto-Drop finden", width=130, height=26,
-            fg_color="#334155", hover_color="#475569",
-            command=self.auto_detect_drop_ui
-        )
-        self.btn_detect_drop.pack(side="right", padx=(6, 0))
+        ctk.CTkRadioButton(
+            row_ov2, text="Ab Beat-Drop / Sekunde", variable=self.overlay_start_mode, value="custom"
+        ).pack(side="left", padx=(0, 10))
+        ctk.CTkRadioButton(
+            row_ov2, text="Von Anfang an", variable=self.overlay_start_mode, value="start"
+        ).pack(side="left")
 
         self.row_ov_slider = ctk.CTkFrame(self.overlay_options_frame, fg_color="transparent")
-        self.row_ov_slider.pack(fill="x", padx=12, pady=2)
-        self.lbl_overlay_sec = ctk.CTkLabel(self.row_ov_slider, text="Start bei: 29.0s", width=120, anchor="w")
+        self.row_ov_slider.pack(fill="x", padx=14, pady=2)
+
+        self.lbl_overlay_sec = ctk.CTkLabel(
+            self.row_ov_slider, text="Start bei: 29.0s", width=110, anchor="w", font=("Arial", 11)
+        )
         self.lbl_overlay_sec.pack(side="left")
+
+        self.btn_detect_drop = ctk.CTkButton(
+            self.row_ov_slider, text="Auto-Drop finden", width=140, height=28,
+            fg_color="#334155", hover_color="#475569", command=self.auto_detect_drop_ui
+        )
+        self.btn_detect_drop.pack(side="right", padx=(8, 0))
+
         self.slider_overlay_sec = ctk.CTkSlider(
             self.row_ov_slider, from_=0, to=120,
             command=lambda v: (self.lbl_overlay_sec.configure(text=f"Start bei: {v:.1f}s"), self.note_change())
         )
         self.slider_overlay_sec.set(29.0)
-        self.slider_overlay_sec.pack(side="right", fill="x", expand=True, padx=5)
+        self.slider_overlay_sec.pack(side="right", fill="x", expand=True, padx=8)
 
-        # Row 3: Placement & Size
         row_ov3 = ctk.CTkFrame(self.overlay_options_frame, fg_color="transparent")
-        row_ov3.pack(fill="x", padx=12, pady=4)
+        row_ov3.pack(fill="x", padx=14, pady=4)
 
-        ctk.CTkLabel(row_ov3, text="Platzierung:").pack(side="left", padx=(0, 6))
+        ctk.CTkLabel(row_ov3, text="Platzierung:").pack(side="left", padx=(0, 8))
         self.overlay_corner_var = ctk.StringVar(value="Wechselt zum Takt (Animiert)")
-        self.combo_corner = ctk.CTkComboBox(
+        ctk.CTkOptionMenu(
             row_ov3,
             values=[
                 "Wechselt zum Takt (Animiert)",
                 "In der Mitte (Zentriert)",
-                "Oben Links",
-                "Oben Rechts",
-                "Unten Links",
-                "Unten Rechts"
+                "Oben Links", "Oben Rechts",
+                "Unten Links", "Unten Rechts"
             ],
-            variable=self.overlay_corner_var,
-            width=220
-        )
-        self.combo_corner.pack(side="left", padx=5)
+            variable=self.overlay_corner_var, width=215
+        ).pack(side="left")
 
-        ctk.CTkLabel(row_ov3, text="Größe:").pack(side="left", padx=(12, 6))
+        row_ov4 = ctk.CTkFrame(self.overlay_options_frame, fg_color="transparent")
+        row_ov4.pack(fill="x", padx=14, pady=4)
+
+        ctk.CTkLabel(row_ov4, text="Größe:").pack(side="left", padx=(0, 8))
         self.overlay_size_var = ctk.StringVar(value="Mittel (30% - Standard)")
-        self.combo_ov_size = ctk.CTkComboBox(
-            row_ov3,
+        ctk.CTkOptionMenu(
+            row_ov4,
             values=[
                 "Kompakt (20% - Dezent)",
                 "Mittel (30% - Standard)",
                 "Groß (45% - Fett & Dominant)"
             ],
-            variable=self.overlay_size_var,
-            width=210
-        )
-        self.combo_ov_size.pack(side="left", padx=5)
+            variable=self.overlay_size_var, width=210
+        ).pack(side="left", padx=(0, 14))
 
         self.overlay_circle_cut_var = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(
-            row_ov3,
-            text="Kreis-Zuschnitt mit Rand",
-            variable=self.overlay_circle_cut_var
-        ).pack(side="left", padx=(12, 5))
+            row_ov4, text="Kreis-Zuschnitt", variable=self.overlay_circle_cut_var
+        ).pack(side="left")
 
-        # Row 4: Speed & Opacity Slider
-        row_ov4 = ctk.CTkFrame(self.overlay_options_frame, fg_color="transparent")
-        row_ov4.pack(fill="x", padx=12, pady=(4, 12))
+        row_ov5 = ctk.CTkFrame(self.overlay_options_frame, fg_color="transparent")
+        row_ov5.pack(fill="x", padx=14, pady=(4, 10))
 
-        speed_col = ctk.CTkFrame(row_ov4, fg_color="transparent")
-        speed_col.pack(side="left", fill="x", expand=True, padx=(0, 10))
-        self.lbl_ov_speed = ctk.CTkLabel(speed_col, text="Dreh-Speed: 1.2x (Umdr./s)", anchor="w")
+        speed_col = ctk.CTkFrame(row_ov5, fg_color="transparent")
+        speed_col.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.lbl_ov_speed = ctk.CTkLabel(speed_col, text="Dreh-Speed: 1.2x", anchor="w", font=("Arial", 11))
         self.lbl_ov_speed.pack(fill="x")
         self.slider_ov_speed = ctk.CTkSlider(
             speed_col, from_=0.2, to=4.0,
-            command=lambda v: (self.lbl_ov_speed.configure(text=f"Dreh-Speed: {v:.1f}x (Umdr./s)"), self.note_change())
+            command=lambda v: (self.lbl_ov_speed.configure(text=f"Dreh-Speed: {v:.1f}x"), self.note_change())
         )
         self.slider_ov_speed.set(1.2)
         self.slider_ov_speed.pack(fill="x", pady=2)
 
-        opacity_col = ctk.CTkFrame(row_ov4, fg_color="transparent")
-        opacity_col.pack(side="right", fill="x", expand=True, padx=(10, 0))
-        self.lbl_ov_opacity = ctk.CTkLabel(opacity_col, text="Deckkraft: 100%", anchor="w")
+        opacity_col = ctk.CTkFrame(row_ov5, fg_color="transparent")
+        opacity_col.pack(side="right", fill="x", expand=True, padx=(8, 0))
+        self.lbl_ov_opacity = ctk.CTkLabel(opacity_col, text="Deckkraft: 100%", anchor="w", font=("Arial", 11))
         self.lbl_ov_opacity.pack(fill="x")
         self.slider_ov_opacity = ctk.CTkSlider(
             opacity_col, from_=10, to=100,
@@ -1383,99 +1543,76 @@ class EditMakerApp(ctk.CTk):
         self.slider_ov_opacity.set(100.0)
         self.slider_ov_opacity.pack(fill="x", pady=2)
 
-        # 9. Render & Controls Frame
-        bottom_frame = ctk.CTkFrame(self.main_container)
-        bottom_frame.pack(fill="x", pady=8)
+    # -----------------------------------------------------------------
+    # Render-Leiste (fixiert am unteren Rand)
+    # -----------------------------------------------------------------
+    def _build_footer(self, parent):
+        bottom_frame = ctk.CTkFrame(parent, corner_radius=12, fg_color="#111c33")
+        bottom_frame.pack(fill="x", pady=(9, 0))
 
         btn_row_action = ctk.CTkFrame(bottom_frame, fg_color="transparent")
-        btn_row_action.pack(fill="x", padx=20, pady=(12, 6))
+        btn_row_action.pack(fill="x", padx=16, pady=(10, 4))
 
         self.btn_generate = ctk.CTkButton(
-            btn_row_action,
-            text="Video Rendern (Pro Studio Engine)",
-            command=self.start_generation,
-            fg_color="#1f8a4c",
-            hover_color="#176b3b",
-            height=44,
-            font=("Arial", 16, "bold")
+            btn_row_action, text="Video Rendern", command=self.start_generation,
+            fg_color="#1f8a4c", hover_color="#176b3b", height=44, width=220,
+            font=("Arial", 15, "bold")
         )
-        self.btn_generate.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.btn_generate.pack(side="left", padx=(0, 8))
 
         self.btn_proxy = ctk.CTkButton(
-            btn_row_action,
-            text="Schnell-Vorschau (480p)",
-            command=self.start_proxy_render,
-            fg_color="#7c3aed",
-            hover_color="#5b21b6",
-            height=44,
-            width=190,
+            btn_row_action, text="Schnell-Vorschau", command=self.start_proxy_render,
+            fg_color="#7c3aed", hover_color="#5b21b6", height=44, width=170,
             font=("Arial", 13, "bold")
         )
-        self.btn_proxy.pack(side="left", padx=(0, 10))
+        self.btn_proxy.pack(side="left", padx=(0, 8))
 
         self.btn_batch = ctk.CTkButton(
-            btn_row_action,
-            text="Batch-Export",
-            command=self.start_batch_export,
-            fg_color="#b45309",
-            hover_color="#92400e",
-            height=44,
-            width=150,
+            btn_row_action, text="Batch-Export", command=self.start_batch_export,
+            fg_color="#b45309", hover_color="#92400e", height=44, width=150,
             font=("Arial", 13, "bold")
         )
-        self.btn_batch.pack(side="left", padx=(0, 10))
+        self.btn_batch.pack(side="left", padx=(0, 8))
+
+        self.post_action_frame = ctk.CTkFrame(btn_row_action, fg_color="transparent")
+        self.post_action_frame.pack_forget()
+        self.btn_open_folder = ctk.CTkButton(
+            self.post_action_frame, text="Öffnen", command=self.open_output_folder,
+            fg_color="#2b719e", hover_color="#1f5375", width=120, height=44
+        )
+        self.btn_open_folder.pack(side="left", padx=(0, 8))
+
+        self.btn_play_video = ctk.CTkButton(
+            self.post_action_frame, text="Ansehen", command=self.play_output_video,
+            fg_color="#2563eb", hover_color="#1d4ed8", width=140, height=44
+        )
+        self.btn_play_video.pack(side="left", padx=(0, 8))
 
         self.btn_cancel = ctk.CTkButton(
-            btn_row_action,
-            text="Abbrechen",
-            command=self.cancel_generation,
-            fg_color="#8b1e1e",
-            hover_color="#631414",
-            height=44,
-            width=110,
-            font=("Arial", 14, "bold"),
-            state="disabled"
+            btn_row_action, text="Abbrechen", command=self.cancel_generation,
+            fg_color="#8b1e1e", hover_color="#631414", height=44, width=120,
+            font=("Arial", 13, "bold"), state="disabled"
         )
         self.btn_cancel.pack(side="right")
 
-        self.progress_bar = ctk.CTkProgressBar(bottom_frame)
-        self.progress_bar.pack(fill="x", padx=20, pady=(4, 6))
+        self.progress_bar = ctk.CTkProgressBar(bottom_frame, height=14)
+        self.progress_bar.pack(fill="x", padx=16, pady=(6, 4))
         self.progress_bar.set(0.0)
 
         status_row = ctk.CTkFrame(bottom_frame, fg_color="transparent")
-        status_row.pack(fill="x", padx=20, pady=(0, 6))
+        status_row.pack(fill="x", padx=16, pady=(0, 8))
 
         self.lbl_status = ctk.CTkLabel(status_row, text="Bereit für Schnitt", font=("Arial", 12), text_color="yellow")
         self.lbl_status.pack(side="left")
 
-        self.lbl_pct = ctk.CTkLabel(status_row, text="0%", font=("Arial", 12, "bold"))
+        self.lbl_eta = ctk.CTkLabel(status_row, text="", font=("Arial", 11), text_color="#94a3b8")
+        self.lbl_eta.pack(side="left", padx=(16, 0))
+
+        self.lbl_pct = ctk.CTkLabel(status_row, text="0%", font=("Arial", 13, "bold"))
         self.lbl_pct.pack(side="right")
 
-        self.lbl_eta = ctk.CTkLabel(status_row, text="", font=("Arial", 11), text_color="#94a3b8")
-        self.lbl_eta.pack(side="right", padx=(0, 18))
-
-        self.post_action_frame = ctk.CTkFrame(bottom_frame, fg_color="transparent")
-        self.btn_open_folder = ctk.CTkButton(
-            self.post_action_frame,
-            text="Ordner im Explorer öffnen",
-            command=self.open_output_folder,
-            fg_color="#2b719e",
-            hover_color="#1f5375",
-            width=200
-        )
-        self.btn_open_folder.pack(side="left", padx=5)
-
-        self.btn_play_video = ctk.CTkButton(
-            self.post_action_frame,
-            text="Video abspielen",
-            command=self.play_output_video,
-            fg_color="#2563eb",
-            hover_color="#1d4ed8",
-            width=150
-        )
-        self.btn_play_video.pack(side="left", padx=5)
-
     def _toggle_overlay_ui(self):
+
         if self.enable_overlay_var.get():
             self.overlay_options_frame.pack(fill="x", padx=5, pady=(0, 8))
         else:
@@ -1876,14 +2013,43 @@ class EditMakerApp(ctk.CTk):
     # Thread-Safe UI Update Helpers
     # =====================================================================
     def _ui_after(self, delay_ms, func):
-        try:
-            return self.after(delay_ms, func)
-        except Exception:
+        """
+        Thread-sichere UI-Aktualisierung.
+
+        Tkinter ist nicht thread-sicher: self.after() aus einem Worker-Thread
+        heraus wird vom Interpreter oft einfach ignoriert (der Callback feuert
+        dann nie). Deshalb landen Aufrufe aus Fremd-Threads in einer Queue,
+        die der Tk-Mainloop regelmaessig abarbeitet.
+        """
+        if threading.current_thread() is threading.main_thread():
             try:
-                func()
+                return self.after(delay_ms, func)
             except Exception:
                 pass
+        else:
+            self._ui_queue.put((delay_ms, func))
             return None
+        try:
+            func()
+        except Exception:
+            pass
+        return None
+
+    def _drain_ui_queue(self):
+        """Laeuft im Tk-Mainloop und arbeitet alle wartenden UI-Calls ab."""
+        try:
+            while True:
+                delay, func = self._ui_queue.get_nowait()
+                try:
+                    func()
+                except Exception as e:
+                    print(f"[UI-Queue] {e}")
+        except queue.Empty:
+            pass
+        try:
+            self.after(40, self._drain_ui_queue)
+        except Exception:
+            pass
 
     def set_eta(self, text):
         self._ui_after(0, lambda: self.lbl_eta.configure(text=text))
@@ -2181,6 +2347,7 @@ class EditMakerApp(ctk.CTk):
         hop = max(1e-4, self.wave_hop)
         mid = h / 2.0
         max_v = float(np.percentile(env, 98)) or 1.0
+        start_offset = self.drop_scan_offset or 0.0
 
         for b in self.wave_beats:
             x = int(b / dur * w)
@@ -2223,6 +2390,23 @@ class EditMakerApp(ctk.CTk):
                     label_x, 8, text="DROP", fill="#ef4444",
                     font=("Arial", 8, "bold"), anchor="w" if label_x > xd else "e"
                 )
+
+        for cand in self.drop_candidates:
+            t = start_offset + cand["time"]
+            x = int(t / dur * w)
+            if not (0 <= x < w):
+                continue
+            if cand.get("is_best"):
+                canvas.create_line(x, 0, x, h, fill="#f0abfc", width=3)
+                canvas.create_oval(x - 5, 2, x + 5, 12, fill="#f0abfc", outline="")
+                canvas.create_text(
+                    x + 6 if x < w - 60 else x - 6, h - 9, text="BEST",
+                    fill="#f0abfc", font=("Arial", 8, "bold"),
+                    anchor="w" if x < w - 60 else "e"
+                )
+            else:
+                canvas.create_line(x, 0, x, h, fill="#a855f7", width=1, dash=(3, 3))
+                canvas.create_oval(x - 3, 3, x + 3, 9, fill="#a855f7", outline="")
 
         if self.wave_playhead is not None:
             self._draw_playhead(self.wave_playhead)
@@ -2280,6 +2464,155 @@ class EditMakerApp(ctk.CTk):
             self.lbl_start.configure(text=f"Start: {self.slider_start.get():.1f}s")
         self.lbl_end.configure(text=f"Ende: {t:.1f}s")
         self.draw_waveform()
+
+    # =====================================================================
+    # Drop-Kandidaten-Analyse (zweite KI-Stufe)
+    # =====================================================================
+    def scan_drop_candidates_ui(self):
+        if not self.audio_path or not os.path.exists(self.audio_path):
+            self.show_error("Hinweis", "Bitte zuerst eine Audio-Datei auswählen.")
+            return
+
+        start_t = float(self.slider_start.get())
+        end_t = float(self.slider_end.get())
+        scan_len = max(1.0, end_t - start_t)
+        if scan_len < 4.0:
+            self.show_error("Hinweis", "Der Auswahlbereich ist zu kurz (mindestens 4 Sekunden).")
+            return
+
+        self.btn_candidates.configure(state="disabled", text="Analysiere...")
+        self.set_status("KI durchsucht den Auswahlbereich nach Drop-Kandidaten...", 0.25)
+
+        def _worker():
+            t0 = time.time()
+            try:
+                y, sr = librosa.load(self.audio_path, offset=start_t, duration=scan_len, sr=22050)
+                found = ai_find_drop_candidates(y, sr, len(y) / float(sr), max_candidates=8)
+            except Exception as e:
+                print(f"[Candidate Scan Error] {e}")
+                found = []
+
+            for item in found:
+                item["abs_time"] = start_t + item["time"]
+
+            def _apply():
+                self.btn_candidates.configure(state="normal", text="Drop-Kandidaten suchen")
+                self.drop_candidates = found
+                self.drop_scan_offset = start_t
+                self.draw_waveform()
+
+                if not found:
+                    self.set_status("Keine Drop-Kandidaten im Auswahlbereich gefunden.", 0.0)
+                    return
+
+                best = found[0]
+                self.wave_drop = best["abs_time"]
+                self.slider_overlay_sec.set(best["time"])
+                self.lbl_overlay_sec.configure(text=f"Start bei: {best['time']:.1f}s")
+                self.overlay_start_mode.set("custom")
+                self.set_status(
+                    f"{len(found)} Drop-Kandidaten | bester bei {best['time']:.1f}s "
+                    f"({time.time() - t0:.1f}s)", 0.0
+                )
+                self.show_drop_candidates(start_t, scan_len)
+
+            self._ui_after(0, _apply)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def show_drop_candidates(self, scan_start, scan_len):
+        if self._candidate_win is not None:
+            try:
+                if self._candidate_win.winfo_exists():
+                    self._candidate_win.destroy()
+            except Exception:
+                pass
+
+        win = ctk.CTkToplevel(self)
+        self._candidate_win = win
+        win.title("Drop-Kandidaten")
+        win.resizable(False, False)
+        win.transient(self)
+
+        ctk.CTkLabel(
+            win, text="Drop-Kandidaten", font=("Arial", 17, "bold")
+        ).pack(pady=(16, 2))
+
+        ctk.CTkLabel(
+            win,
+            text=f"Auswahlbereich: {scan_start:.1f}s - {scan_start + scan_len:.1f}s",
+            font=("Arial", 11), text_color="#94a3b8"
+        ).pack(pady=(0, 2))
+
+        ctk.CTkLabel(
+            win,
+            text="Bester Kandidat ist bereits gesetzt. Zeile anklicken zum Uebernehmen.",
+            font=("Arial", 11), text_color="#38bdf8"
+        ).pack(pady=(0, 10))
+
+        rows = ctk.CTkFrame(win, fg_color="transparent")
+        rows.pack(fill="x", padx=16)
+
+        for idx, cand in enumerate(self.drop_candidates):
+            conf = float(cand.get("confidence", 0.0))
+            is_best = bool(cand.get("is_best"))
+
+            row = ctk.CTkFrame(rows, fg_color="transparent")
+            row.pack(fill="x", pady=2)
+
+            tag = "BEST" if is_best else f"#{idx + 1}"
+            color = "#f0abfc" if is_best else "#e2e8f0"
+
+            btn = ctk.CTkButton(
+                row,
+                text=f"{tag:<5}",
+                width=58, height=30,
+                fg_color="#7e22ce" if is_best else "#334155",
+                hover_color="#6b21a8" if is_best else "#475569",
+                command=lambda c=cand: self._apply_drop_candidate(c)
+            )
+            btn.pack(side="left", padx=(0, 8))
+
+            ctk.CTkLabel(
+                row, text=f"{cand['time']:>6.2f}s", width=70, anchor="w",
+                font=("Consolas", 13, "bold"), text_color=color
+            ).pack(side="left")
+
+            bar_w = int(120 * max(0.05, conf))
+            bar = ctk.CTkProgressBar(row, width=120, height=14, progress_color="#a855f7")
+            bar.pack(side="left", padx=8)
+            bar.set(conf)
+
+            ctk.CTkLabel(
+                row, text=f"{conf * 100:>3.0f}%", width=40, anchor="w",
+                font=("Consolas", 11), text_color="#94a3b8"
+            ).pack(side="left")
+
+            note = "Intro-Regel" if cand.get("intro_promoted") else ""
+            ctk.CTkLabel(
+                row, text=note, width=90, anchor="w",
+                font=("Arial", 10), text_color="#38bdf8"
+            ).pack(side="left", padx=6)
+
+            ctk.CTkLabel(
+                row, text=f"Sprung {cand.get('jump', 0):.2f}", anchor="e",
+                font=("Arial", 10), text_color="#475569"
+            ).pack(side="right", padx=6)
+
+        ctk.CTkButton(
+            win, text="Schließen", command=lambda: (win.destroy(), setattr(self, "_candidate_win", None)),
+            fg_color="#444444", hover_color="#555555", height=34, width=150
+        ).pack(pady=12)
+        self._center_window(win, min_w=480)
+
+    def _apply_drop_candidate(self, cand):
+        t = float(cand["time"])
+        self.slider_overlay_sec.set(t)
+        self.lbl_overlay_sec.configure(text=f"Start bei: {t:.1f}s")
+        self.overlay_start_mode.set("custom")
+        self.wave_drop = float(cand.get("abs_time", self.drop_scan_offset + t))
+        self.draw_waveform()
+        self.set_status(f"Drop-Kandidat bei {t:.1f}s uebernommen.", 0.0)
 
     # =====================================================================
     # Best-Moment-Finder
@@ -3941,7 +4274,7 @@ class EditMakerApp(ctk.CTk):
             self.set_status(f"Export erfolgreich abgeschlossen: {os.path.basename(out_path)}", 1.0)
             if not batch_label:
                 self.show_render_done(out_path)
-            self._ui_after(0, lambda: self.post_action_frame.pack(fill="x", padx=20, pady=(6, 10)))
+            self._ui_after(0, lambda: self.post_action_frame.pack(side="left", padx=(14, 0)))
 
         except InterruptedError:
             self.set_status("Rendern abgebrochen. Keine Datei erstellt.", 0.0)

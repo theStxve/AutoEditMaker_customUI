@@ -39,6 +39,12 @@ Ein professionelles Beat-Sync Video-Editing Tool mit moderner CustomTkinter-Ober
   - Waehlt den Drop, der in den lautesten Abschnitt fuehrt - nicht den mit dem groessten relativen Sprung.
   - Intro-Regel: beginnt der Song still, gewinnt der erste echte Drop. Snapping auf den Transient.
   - Analysezeit 0.4-1.5s (ohne HPSS, das allein 10s pro Track gekostet haette).
+- **Drop-Kandidaten-Analyse (zweite KI-Stufe)**:
+  - "Drop-Kandidaten suchen" durchsucht ausschliesslich den markierten Auswahlbereich nach saemtlichen Drops.
+  - Ergebnis-Fenster listet jeden Treffer mit Zeit, Konfidenz, Energiesprung und Kennzeichnung, ob die Intro-Regel gegriffen hat.
+  - Der beste Kandidat wird automatisch gesetzt und violett als "BEST" markiert, alle weiteren als gestrichelte Linien - in der Waveform und in der Liste.
+  - Zeile anklicken uebernimmt einen anderen Kandidaten. Bis zu 8 Kandidaten pro Bereich.
+- **Fensterlayout**: zweispaltiges Dashboard (Eingabe links, Effekte rechts), Profil- und Renderleiste fixiert, Render-Buttons immer sichtbar statt im Scrollbereich versteckt.
 - **Drop-Pre-Roll / Intro**: Edit startet auf Wunsch 2, 4, 8, 16 oder 32 Beats vor dem Drop. Reicht der Pre-Roll ueber den Trim-Start hinaus, bleibt das komplette Intro erhalten. Audio wird per `atrim/asetpts` passend mitverschoben, Bild und Ton bleiben synchron.
 - **Impact-Rhythmus**: Flash-/Shake-Impacts auf jedem Cut, jedem 2. oder nur jedem 4. Cut. Ohne diese Drosselung wirkt ein Flash auf *jedem* schnellen Schnitt, als wuerde das Video aus dem Takt rutschen.
 - **Timing-kopplte Effekt-Dauern**: Bloom-Flash, Bass-Shake, RGB und Punch-Zoom skalieren mit der Laenge des Cuts. Ein 0.14s-Flash auf einem 0.28s-Cut (2x-Tempo) frisst den halben Beat und sieht dadurch aus wie ein Timing-Fehler.
