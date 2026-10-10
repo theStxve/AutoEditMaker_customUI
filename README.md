@@ -25,10 +25,32 @@ Ein professionelles Beat-Sync Video-Editing Tool mit moderner CustomTkinter-Ober
   - **Slow Push-In**: Sanfte filmische Kamerafahrt fuer ruhigere Passagen.
   - **Speed-Ramp**: Taktgenaue Geschwindigkeitsrampen.
   - **Effekt-Intensitaet**: Stufenlos von 20% bis 200% anpassbar.
+- **Effekt-Engine (CapCut-Stil, bewusst sparsam)**:
+  - Die Mehrheit der Cuts bleibt voellig sauber. Effekte landen auf musikalischen
+    Positionen - Drop, Akzente, Cadence - und nicht auf jedem Schnitt. Genau das
+    war der Unterschied zwischen "sieht aus wie ein Beat-Edit" und "sieht aus wie
+    eine PowerPoint-Folienfolge". Gemessen: 62-90% der Cuts bleiben unberuehrt.
+  - **Whip Pan** mit echter Bewegungsunschaerfe (Linienkernel) als Uebergang, Richtungen alternierend.
+  - **Punch In/Out** mit Smoothstep-Ease, Peak exakt auf dem Transient, Abklingen in <=200ms.
+  - **Zoom-Blur-Burst** und optionaler **Freeze-Frame** genau auf dem Beat-Drop.
+  - **Filmkorn** als statisches Feld. Pro Frame gewuerfelt wuerde die Interframe-Kompression
+    zerstoeren und dieselbe Renderzeit um das 8-Fache aufblaehen.
+  - Kein Dauer-Zoom mehr: die alte Engine transformierte jeden Frame, dadurch wirkte
+    jedes Video wie eine langsame Diashow.
+  - Fuenf Effekt-Sets: CapCut Kinetic, Cinematic, Beat Edit, Maximal, Clean Cut.
+- **Collage & Spin** (aus dem Original-Repo):
+  - 4er-Raster-Collage (Hintergrund + 4 Kacheln, Beat fuer Beat einblendend) und 16-Raster (4x4).
+  - Spin mit 360-Grad-Drehung ueber die Clipdauer.
+  - Beide verbrauchen exakt die Beats, die sie belegen - das Beat-Gitter bleibt synchron.
+- **Reproduzierbare Renders**:
+  - Effekt-Placement und Quell-Ausschnitte werden aus einem CRC32-Seed aus Song + Trim abgeleitet.
+  - Gleiche Musik + gleicher Trim => identisches Ergebnis, unabhaengig vom Ausgabedateinamen.
 - **Praeziser Beat-Sync & Takt-Magnet**:
   - Multi-Band Transient Tracking (Kicks und Snares getrennt) mit Attack-Backtracking.
   - Manuelle Klicks rasten ueber den Takt-Magneten praezise an den echten Drum-Peaks ein.
   - Frame-Quantisierung verhindert jeglichen kumulierten Drift ueber die gesamte Songlaenge.
+- **Impact-Rhythmus**: Akzent-Effekte auf jedem, jedem 2. oder nur jedem 4. Cut.
+- **Timing-kopplte Effekt-Dauern**: Bloom-Flash, Bass-Shake, RGB und Punch-Zoom skalieren mit der Laenge des Cuts. Ein 0.14s-Flash auf einem 0.28s-Cut (2x-Tempo) frisst den halben Beat und sieht dadurch aus wie ein Timing-Fehler.
 - **Latenz-Kalibrierung fuer den manuellen Modus**:
   - Tastatur, Soundkarte, Bluetooth-Headset und Monitor bringen jeweils eigene Verzoegerung mit. Ohne Korrektur ist jeder manuelle Cut um genau diesen Betrag daneben.
   - "Kalibrieren" spielt 12 Klicks, der Nutzer tippt mit, und der Median der Differenz wird als Offset uebernommen und in `app_settings.json` gespeichert.
@@ -46,7 +68,7 @@ Ein professionelles Beat-Sync Video-Editing Tool mit moderner CustomTkinter-Ober
   - Zeile anklicken uebernimmt einen anderen Kandidaten. Bis zu 8 Kandidaten pro Bereich.
 - **Fensterlayout**: zweispaltiges Dashboard (Eingabe links, Effekte rechts), Profil- und Renderleiste fixiert, Render-Buttons immer sichtbar statt im Scrollbereich versteckt.
 - **Drop-Pre-Roll / Intro**: Edit startet auf Wunsch 2, 4, 8, 16 oder 32 Beats vor dem Drop. Reicht der Pre-Roll ueber den Trim-Start hinaus, bleibt das komplette Intro erhalten. Audio wird per `atrim/asetpts` passend mitverschoben, Bild und Ton bleiben synchron.
-- **Impact-Rhythmus**: Flash-/Shake-Impacts auf jedem Cut, jedem 2. oder nur jedem 4. Cut. Ohne diese Drosselung wirkt ein Flash auf *jedem* schnellen Schnitt, als wuerde das Video aus dem Takt rutschen.
+- **Impact-Rhythmus**: Akzent-Effekte auf jedem, jedem 2. oder nur jedem 4. Cut.
 - **Timing-kopplte Effekt-Dauern**: Bloom-Flash, Bass-Shake, RGB und Punch-Zoom skalieren mit der Laenge des Cuts. Ein 0.14s-Flash auf einem 0.28s-Cut (2x-Tempo) frisst den halben Beat und sieht dadurch aus wie ein Timing-Fehler.
 - **Jitter-Korrektur**: Snappt jeden Beat auf den naechsten echten Transient (+-60ms) - kein Flackern mehr im 2x-Tempo.
 - **Best-Moment-Finder**: findet die energiereichste Passage (15/30/60/90s) und legt den Hook so, dass der Drop in den ersten Sekunden landet.

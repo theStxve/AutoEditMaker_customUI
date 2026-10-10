@@ -18,6 +18,7 @@ import imageio_ffmpeg
 import PIL.Image
 import PIL.ImageDraw
 import json
+import zlib
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -586,6 +587,224 @@ def format_eta(seconds):
     if seconds < 60:
         return f"{seconds}s"
     return f"{seconds // 60}m {seconds % 60:02d}s"
+
+
+# =====================================================================
+# Effekt-Engine: Bausteine & Stil-Profile
+# =====================================================================
+
+EFFECT_SETS = {
+    "CapCut Kinetic (Empfohlen)": {
+        "punch": 0.045, "punch_dur": 0.16,
+        "whip_prob": 0.10, "whip_px": 0.055,
+        "flash_on_accent": True, "flash_max": 0.22,
+        "shake_on_accent": True, "shake_px": 3.0,
+        "zoom_blur_on_drop": True,
+        "freeze_on_drop": True,
+        "grain": 0.010,
+        "vignette": True,
+        "collage_prob": 0.018,
+        "spin_prob": 0.010,
+    },
+    "Cinematic (Zurückhaltend)": {
+        "punch": 0.028, "punch_dur": 0.14,
+        "whip_prob": 0.05, "whip_px": 0.035,
+        "flash_on_accent": True, "flash_max": 0.14,
+        "shake_on_accent": False, "shake_px": 0.0,
+        "zoom_blur_on_drop": True,
+        "freeze_on_drop": False,
+        "grain": 0.014,
+        "vignette": True,
+        "collage_prob": 0.0,
+        "spin_prob": 0.0,
+    },
+    "Beat Edit (Dynamisch)": {
+        "punch": 0.070, "punch_dur": 0.18,
+        "whip_prob": 0.22, "whip_px": 0.075,
+        "flash_on_accent": True, "flash_max": 0.34,
+        "shake_on_accent": True, "shake_px": 5.0,
+        "zoom_blur_on_drop": True,
+        "freeze_on_drop": True,
+        "grain": 0.008,
+        "vignette": True,
+        "collage_prob": 0.030,
+        "spin_prob": 0.018,
+    },
+    "Maximal (Volle Power)": {
+        "punch": 0.095, "punch_dur": 0.20,
+        "whip_prob": 0.34, "whip_px": 0.095,
+        "flash_on_accent": True, "flash_max": 0.48,
+        "shake_on_accent": True, "shake_px": 8.0,
+        "zoom_blur_on_drop": True,
+        "freeze_on_drop": True,
+        "grain": 0.006,
+        "vignette": True,
+        "collage_prob": 0.045,
+        "spin_prob": 0.028,
+    },
+    "Keine Effekte (Clean Cut)": {
+        "punch": 0.0, "punch_dur": 0.0,
+        "whip_prob": 0.0, "whip_px": 0.0,
+        "flash_on_accent": False, "flash_max": 0.0,
+        "shake_on_accent": False, "shake_px": 0.0,
+        "zoom_blur_on_drop": False,
+        "freeze_on_drop": False,
+        "grain": 0.006,
+        "vignette": True,
+        "collage_prob": 0.0,
+        "spin_prob": 0.0,
+    },
+}
+
+
+def get_effect_set(name):
+    base = EFFECT_SETS.get(name)
+    if base is None:
+        base = EFFECT_SETS["CapCut Kinetic (Empfohlen)"]
+    return dict(base)
+
+
+def build_motion_blur_kernel(length, angle_deg):
+    """Lineare Bewegungsunschärfe als Kernel fuer cv2.filter2D."""
+    length = max(3, int(length) | 1)
+    if length % 2 == 0:
+        length += 1
+    k = np.zeros((length, length), np.float32)
+    c = length // 2
+    rad = np.deg2rad(float(angle_deg))
+    dx, dy = np.cos(rad), np.sin(rad)
+    for i in range(length):
+        step = (i - c) / float(max(1, c))
+        x = int(round(c + dx * step * c))
+        y = int(round(c + dy * step * c))
+        if 0 <= x < length and 0 <= y < length:
+            k[y, x] += 1.0
+    total = float(k.sum())
+    if total <= 0:
+        return np.full((length, length), 1.0 / (length * length), np.float32)
+    return k / total
+
+
+def motion_blur_frame(frame, length, angle_deg):
+    if length < 3:
+        return frame
+    kernel = build_motion_blur_kernel(length, angle_deg)
+    return cv2.filter2D(frame, -1, kernel, borderType=cv2.BORDER_REFLECT)
+
+
+def radial_zoom_blur(frame, amount):
+    """Radialer Zoom-Blur - sieht nach Geschwindigkeit aus, nicht nach Filter."""
+    if amount <= 0.002:
+        return frame
+    h, w = frame.shape[:2]
+    s = 1.0 + amount
+    nh, nw = max(h, int(round(h * s))), max(w, int(round(w * s)))
+    big = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
+    x0 = (nw - w) // 2
+    y0 = (nh - h) // 2
+    zoomed = big[y0:y0 + h, x0:x0 + w]
+    if zoomed.shape[0] != h or zoomed.shape[1] != w:
+        return frame
+    a = min(0.8, amount * 1.25)
+    return cv2.addWeighted(frame, 1.0 - a, zoomed, a, 0.0)
+
+
+def build_grain_field(h, w, amount, seed):
+    """
+    Statisches Filmkorn-Feld.
+
+    Wichtig: das Korn muss ueber die Frames GLEICH bleiben. Pro Frame neu
+    gewuerfelt zerstoert die Interframe-Kompression voellig - dieselbe
+    Renderzeit kostet ~8x Dateigroesse.
+    """
+    if amount <= 0.0:
+        return None
+    rng = np.random.default_rng(seed)
+    tile = rng.normal(0.0, 255.0 * amount, (256, 256)).astype(np.float32)
+    reps_y = int(np.ceil(h / 256)) + 1
+    reps_x = int(np.ceil(w / 256)) + 1
+    field = np.tile(tile, (reps_y, reps_x))
+    return np.ascontiguousarray(field[:h + 256, :w + 256])
+
+
+def apply_film_grain(frame, field, frame_index=0):
+    """
+    Statisches Korn. Bewusst kein Rollen pro Frame: das wuerde die
+    Interframe-Kompression zerstoeren und die Datei um ein Vielfaches
+    aufblaehen. Optisch ist der Unterschied bei 1% kaum sichtbar.
+    """
+    if field is None:
+        return frame
+    h, w = frame.shape[:2]
+    noise = field[:h, :w]
+    if noise.shape[0] != h or noise.shape[1] != w:
+        noise = np.resize(noise, (h, w))
+    out = frame.astype(np.float32)
+    out += noise[:, :, None]
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def build_effect_plan(cut_idx, total_cuts, cut_global_start, kick_strength,
+                     is_drop_cut, cfg, intensity, rng):
+    """
+    Legt fest, was EIN Cut bekommt - bewusst sparsam.
+
+    Grundregel: die Mehrheit der Cuts bleibt sauber. Effekte landen auf
+    musikalischen Positionen (Drop, Akzente) und nicht auf jedem Schnitt,
+    sonst wirkt das Ergebnis wie eine PowerPoint-Folienfolge.
+    """
+    punch = cfg["punch"] * (0.55 + 0.45 * intensity)
+    whip_px = cfg["whip_px"] * (0.55 + 0.45 * intensity)
+    shake_px = cfg["shake_px"] * (0.55 + 0.45 * intensity)
+    punch_dur = cfg["punch_dur"]
+
+    plan = {
+        "transform": "none",
+        "amount": 0.0,
+        "duration": 0.0,
+        "angle": 0.0,
+        "flash": 0.0,
+        "shake": 0.0,
+        "zoom_blur": 0.0,
+        "blur_len": 0,
+    }
+
+    # Impact-Rhythmus: Akzent-Effekte nur auf jedem n-ten Cut
+    cadence = max(1, int(cfg.get("cadence", 1)))
+    accent_gate = (cut_idx % cadence) == 0
+
+    # Whip-Pan als "Uebergang" - Richtungen wechseln, damit es nicht als Muster lesbar wird
+    if whip_px > 0.0 and accent_gate and rng.random() < cfg["whip_prob"]:
+        plan["transform"] = "whip_pan"
+        plan["amount"] = whip_px
+        plan["duration"] = min(0.16, punch_dur + 0.04)
+        plan["angle"] = 0.0 if (cut_idx % 2 == 0) else 180.0
+        plan["blur_len"] = 9
+        return plan
+
+    # Drop: Zoom-Blur-Burst statt Dauerbewegung
+    if is_drop_cut and cfg["zoom_blur_on_drop"]:
+        plan["transform"] = "punch_in"
+        plan["amount"] = max(punch * 1.4, 0.03)
+        plan["duration"] = max(0.12, punch_dur * 0.8)
+        plan["zoom_blur"] = 0.10
+        plan["flash"] = min(0.5, max(0.10, kick_strength * 0.45))
+        return plan
+
+    # Akzent-Schnitte: Punch-In + optional Flash
+    accent = accent_gate and kick_strength >= 0.45
+    if accent and punch > 0.0:
+        plan["transform"] = "punch_in" if (cut_idx // 4) % 2 == 0 else "punch_out"
+        plan["amount"] = punch * (0.75 + 0.35 * kick_strength)
+        plan["duration"] = min(punch_dur, 0.45 * punch_dur + 0.4 * kick_strength * punch_dur)
+
+    if cfg["flash_on_accent"] and accent and kick_strength >= 0.5:
+        plan["flash"] = min(cfg["flash_max"], kick_strength * cfg["flash_max"])
+
+    if cfg["shake_on_accent"] and accent and shake_px > 0.0 and kick_strength >= 0.75:
+        plan["shake"] = shake_px * kick_strength
+
+    return plan
 
 
 def build_metronome_click(sr=44100):
@@ -1358,7 +1577,15 @@ class EditMakerApp(ctk.CTk):
         cadence_row = ctk.CTkFrame(effects_frame, fg_color="transparent")
         cadence_row.pack(fill="x", padx=14, pady=2)
 
-        ctk.CTkLabel(cadence_row, text="Impact-Rhythmus:").pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(cadence_row, text="Effekt-Set:").pack(side="left", padx=(0, 8))
+        self.effect_set_var = ctk.StringVar(value="CapCut Kinetic (Empfohlen)")
+        ctk.CTkOptionMenu(
+            cadence_row,
+            values=list(EFFECT_SETS.keys()),
+            variable=self.effect_set_var, width=225
+        ).pack(side="left")
+
+        ctk.CTkLabel(cadence_row, text="Akzente:").pack(side="left", padx=(16, 8))
         self.fx_cadence_var = ctk.StringVar(value="Jeder 2. Cut (Sauberer Takt)")
         ctk.CTkOptionMenu(
             cadence_row,
@@ -1368,11 +1595,38 @@ class EditMakerApp(ctk.CTk):
                 "Jeder 4. Cut (Nur Akzente)"
             ],
             variable=self.fx_cadence_var, width=185
-        ).pack(side="left", padx=(0, 18))
+        ).pack(side="left")
 
+        grain_row = ctk.CTkFrame(effects_frame, fg_color="transparent")
+        grain_row.pack(fill="x", padx=14, pady=2)
+
+        self.fx_grain = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            grain_row, text="Filmkorn", variable=self.fx_grain, font=("Arial", 11)
+        ).pack(side="left", padx=(0, 14))
+        self.fx_zoom_blur = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            grain_row, text="Zoom-Blur am Drop", variable=self.fx_zoom_blur, font=("Arial", 11)
+        ).pack(side="left", padx=(0, 14))
         self.fx_cinematic_lut = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(
-            cadence_row, text="Cinematic LUT", variable=self.fx_cinematic_lut
+            grain_row, text="Cinematic LUT", variable=self.fx_cinematic_lut, font=("Arial", 11)
+        ).pack(side="left", padx=(0, 14))
+        self.fx_vignette = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            grain_row, text="Vignette", variable=self.fx_vignette, font=("Arial", 11)
+        ).pack(side="left")
+
+        collage_row = ctk.CTkFrame(effects_frame, fg_color="transparent")
+        collage_row.pack(fill="x", padx=14, pady=2)
+
+        self.fx_collage = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            collage_row, text="Collage (4er-Raster)", variable=self.fx_collage, font=("Arial", 11)
+        ).pack(side="left", padx=(0, 14))
+        self.fx_spin = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            collage_row, text="Spin (360°-Drehung)", variable=self.fx_spin, font=("Arial", 11)
         ).pack(side="left")
 
         intensity_row = ctk.CTkFrame(effects_frame, fg_color="transparent")
@@ -1398,21 +1652,16 @@ class EditMakerApp(ctk.CTk):
         self.fx_shake = ctk.BooleanVar(value=True)
         self.fx_bloom_flash = ctk.BooleanVar(value=True)
         self.fx_punch_zoom = ctk.BooleanVar(value=True)
-        self.fx_slow_push = ctk.BooleanVar(value=True)
-        self.fx_rgb_shock = ctk.BooleanVar(value=True)
-        self.fx_vignette = ctk.BooleanVar(value=True)
+        self.fx_slow_push = ctk.BooleanVar(value=False)
+        self.fx_rgb_shock = ctk.BooleanVar(value=False)
         self.fx_speedramp = ctk.BooleanVar(value=True)
         self.fx_bass_pulse = ctk.BooleanVar(value=False)
 
         boxes = [
-            (self.fx_shake, "Bass-Shake (Tilt & Recoil)"),
-            (self.fx_bloom_flash, "Exposure Bloom-Flash"),
-            (self.fx_punch_zoom, "Punch-Zoom (Optischer Ease)"),
-            (self.fx_slow_push, "Slow Push-In (Kamerafahrt)"),
-            (self.fx_rgb_shock, "Radial RGB-Aberration"),
-            (self.fx_vignette, "Cinematic Vignette"),
+            (self.fx_shake, "Shake auf Akzenten"),
+            (self.fx_bloom_flash, "Flash auf Akzenten"),
+            (self.fx_punch_zoom, "Punch In/Out"),
             (self.fx_speedramp, "Speed-Ramp (Sync-Safe)"),
-            (self.fx_bass_pulse, "Bass-Pulse (Kick-Darkening)"),
         ]
         for idx, (var, label) in enumerate(boxes):
             ctk.CTkCheckBox(
@@ -1748,6 +1997,11 @@ class EditMakerApp(ctk.CTk):
         if "overlay_circle" in data: self.overlay_circle_cut_var.set(bool(data["overlay_circle"]))
         if "fx_bass_pulse" in data: self.fx_bass_pulse.set(bool(data["fx_bass_pulse"]))
         if "fx_cadence" in data: self.fx_cadence_var.set(data["fx_cadence"])
+        if "effect_set" in data: self.effect_set_var.set(data["effect_set"])
+        if "fx_grain" in data: self.fx_grain.set(bool(data["fx_grain"]))
+        if "fx_collage" in data: self.fx_collage.set(bool(data["fx_collage"]))
+        if "fx_spin" in data: self.fx_spin.set(bool(data["fx_spin"]))
+        if "fx_zoom_blur" in data: self.fx_zoom_blur.set(bool(data["fx_zoom_blur"]))
         if "ai_reframe" in data: self.ai_reframe_var.set(bool(data["ai_reframe"]))
         if "auto_loudness" in data: self.auto_loudness_var.set(bool(data["auto_loudness"]))
         if "snap_jitter" in data: self.snap_jitter_var.set(bool(data["snap_jitter"]))
@@ -1832,7 +2086,8 @@ class EditMakerApp(ctk.CTk):
             self.fade_out_var, self.combo_fx_style, self.fx_cinematic_lut,
             self.fx_shake, self.fx_bloom_flash, self.fx_punch_zoom,
             self.fx_slow_push, self.fx_rgb_shock, self.fx_vignette,
-            self.fx_speedramp, self.fx_bass_pulse, self.fx_cadence_var, self.ai_reframe_var,
+            self.fx_speedramp, self.fx_bass_pulse, self.fx_cadence_var, self.effect_set_var,
+            self.fx_grain, self.fx_collage, self.fx_spin, self.fx_zoom_blur, self.ai_reframe_var,
             self.auto_loudness_var, self.snap_jitter_var, self.preroll_var,
             self.enable_overlay_var, self.overlay_corner_var,
             self.overlay_size_var, self.overlay_start_mode,
@@ -2880,6 +3135,11 @@ class EditMakerApp(ctk.CTk):
             "allow_speedramp": self.fx_speedramp.get(),
             "allow_bass_pulse": self.fx_bass_pulse.get(),
             "fx_cadence": self.fx_cadence_var.get(),
+            "effect_set": self.effect_set_var.get(),
+            "fx_grain": self.fx_grain.get(),
+            "fx_collage": self.fx_collage.get(),
+            "fx_spin": self.fx_spin.get(),
+            "fx_zoom_blur": self.fx_zoom_blur.get(),
             "enable_snap": self.snap_jitter_var.get(),
             "preroll_choice": self.preroll_var.get(),
             "ai_audio_analysis": self.ai_audio_analysis_var.get(),
@@ -3493,12 +3753,45 @@ class EditMakerApp(ctk.CTk):
             allow_speedramp = cfg["allow_speedramp"]
             allow_bass_pulse = cfg["allow_bass_pulse"]
 
-            # Impact-Cadence: wie oft die Flash-/Shake-Impacts feuern
-            cadence_step = 4
-            if "Jeder Cut" in cfg["fx_cadence"]:
-                cadence_step = 1
-            elif "Jeder 2. Cut" in cfg["fx_cadence"]:
+            # Impact-Cadence: Akzent-Effekte auf jedem / jedem 2. / jedem 4. Cut
+            cadence_step = 1
+            if "Jeder 2. Cut" in cfg["fx_cadence"]:
                 cadence_step = 2
+            elif "Jeder 4. Cut" in cfg["fx_cadence"]:
+                cadence_step = 4
+
+            fx_cfg = get_effect_set(cfg["effect_set"])
+            fx_cfg["cadence"] = cadence_step
+            # Die alten Checkboxen steuern weiterhin die Teilsysteme
+            if not allow_shake:
+                fx_cfg["shake_on_accent"] = False
+            if not allow_bloom:
+                fx_cfg["flash_on_accent"] = False
+            if not allow_punch:
+                fx_cfg["punch"] = 0.0
+                fx_cfg["whip_prob"] = 0.0
+            if not allow_rgb:
+                fx_cfg["zoom_blur_on_drop"] = False
+            if not cfg["fx_grain"]:
+                fx_cfg["grain"] = 0.0
+            if not allow_vignette:
+                fx_cfg["vignette"] = False
+            if not cfg["fx_zoom_blur"]:
+                fx_cfg["zoom_blur_on_drop"] = False
+            if not cfg["fx_collage"]:
+                fx_cfg["collage_prob"] = 0.0
+            if not cfg["fx_spin"]:
+                fx_cfg["spin_prob"] = 0.0
+
+            grain_amount = float(fx_cfg.get("grain", 0.0))
+            collage_prob = float(fx_cfg.get("collage_prob", 0.0))
+            spin_prob = float(fx_cfg.get("spin_prob", 0.0))
+            # Effekt-Placement ist reproduzierbar: gleiche Musik + gleicher Trim
+            # => identisches Ergebnis, unabhaengig vom Ausgabedateinamen.
+            seed_src = f"{os.path.basename(self.audio_path or '')}|{start_t:.3f}|{total_duration:.3f}"
+            render_seed = zlib.crc32(seed_src.encode("utf-8")) & 0x7FFFFFFF
+            effect_rng = random.Random(render_seed)
+            cut_rng = random.Random(render_seed + 101)
 
             # Jitter-Korrektur & Drop-Pre-Roll
             enable_snap = cfg["enable_snap"]
@@ -3748,6 +4041,14 @@ class EditMakerApp(ctk.CTk):
             frame_counts = [clean_frame_indices[k + 1] - clean_frame_indices[k] for k in range(len(clean_frame_indices) - 1)]
             durations = [fc / float(fps) for fc in frame_counts]
 
+            # Welcher Cut liegt auf dem Drop? Genau einer bekommt den Special-Look.
+            active_drop_index = None
+            if drop_timestamp > 0.05 and len(clean_frame_indices) > 1:
+                starts = np.array(clean_frame_indices, dtype=np.float64) / float(fps)
+                nearest = int(np.argmin(np.abs(starts - drop_timestamp)))
+                active_drop_index = clean_frame_indices[nearest]
+                print(f"[Effekte] Drop-Cut: #{nearest} bei {starts[nearest]:.2f}s")
+
             if has_overlay:
                 if overlay_start_type == "start":
                     active_overlay_start = 0.0
@@ -3760,6 +4061,8 @@ class EditMakerApp(ctk.CTk):
 
             if has_overlay:
                 print(f"[Overlay] Aktiv ab {active_overlay_start:.2f}s (Trigger: {overlay_start_type}, Drop: {drop_timestamp:.2f}s)")
+            if has_overlay and overlay_start_type == "drop" and drop_timestamp > 0:
+                print(f"[Effekte] Drop-Cut bei {drop_timestamp:.2f}s")
 
             # -------------------------------------------------------------
             # STEP 2: Video-Zuschnitt & Hardware-Beschleunigte Effekte
@@ -3802,6 +4105,7 @@ class EditMakerApp(ctk.CTk):
             th = th - (th % 2)
 
             video_positions = {}
+            cut_rng = random.Random(12345)   # ersetzt weiter unten nach dem Seed
 
             # Precompute Vignette Mask
             vignette_mask = _build_vignette_mask(tw, th) if allow_vignette else None
@@ -3920,7 +4224,7 @@ class EditMakerApp(ctk.CTk):
                         cs = 0.0
                 else:
                     max_s = max(0, safe_max_dur - dur)
-                    cs = random.uniform(0, max_s) if max_s > 0 else 0.0
+                    cs = cut_rng.uniform(0, max_s) if max_s > 0 else 0.0
                 end_s = min(cs + dur, safe_max_dur)
                 sc = src.subclip(cs, end_s)
                 if path is not None:
@@ -3928,134 +4232,146 @@ class EditMakerApp(ctk.CTk):
                     video_positions[path] = next_pos
                 if sc.duration < dur:
                     sc = sc.fx(vfx.loop, duration=dur)
-                return sc
-
+                return sc# =========================================================
+            # Effekt-Engine (sparsam, CapCut-Stil)
+            #
+            # Grundregeln:
+            #  - Die Mehrheit der Cuts bleibt sauber (kein Zoom, kein Shake)
+            #  - Effekte sitzen auf dem Transient und klingen in <=200ms ab
+            #  - Keine Dauerbewegung ueber den ganzen Cut
+            #  - Jeder Effekt ist ein eigener, bewusst gesetzter Akzent
             # =========================================================
-            # Modern High-Impact Edit Effect Engine (Rhythm-Aware)
-            # =========================================================
-            def apply_pro_effects(clip, dur, cut_idx=0, cut_global_start=0.0):
-                # Effekt-Dauern an die Cut-Laenge koppeln: bei schnellen
-                # 2x-Edits darf der Flash nicht in den naechsten Beat laufen,
-                # sonst sieht der Schnitt optisch aus dem Takt gerutscht.
-                fd = min(0.09, dur * 0.22)
-                sd = min(0.10, dur * 0.34)
-                rd = min(0.06, dur * 0.18)
-                pz = min(0.22, dur * 0.6)
-
+            def apply_pro_effects(clip, dur, cut_idx=0, cut_global_start=0.0, is_drop_cut=False):
                 kick_strength = 0.0
-                if allow_bass_pulse and kick_env is not None:
+                if kick_env is not None:
                     try:
                         k_idx = int(round((cut_global_start * kick_sr) / kick_hop))
                         if 0 <= k_idx < len(kick_env):
-                            # Der Kick kommt erst NACH dem Cut-Punkt (onset_backtrack
-                            # legt den Schnitt vor den Transient), also Vorwaertsfenster.
                             k_hi = min(len(kick_env), k_idx + 8)
                             kick_strength = float(np.clip(np.max(kick_env[k_idx:k_hi]), 0.0, 1.0))
                     except Exception:
                         kick_strength = 0.0
 
-                # Impact-Cadence: Impact-Effekte nicht auf jedem Cut ausloesen
-                cadence_hit = (cut_idx % cadence_step) == 0
+                plan = build_effect_plan(
+                    cut_idx, total_dur_count, cut_global_start, kick_strength,
+                    is_drop_cut, fx_cfg, intensity, effect_rng
+                )
 
-                # Determine Motion Cadence for this cut:
-                if "Dezent" in fx_style:
-                    motion_type = 1 if (cut_idx % 2 == 0) else 3
-                elif "Volle Power" in fx_style or "Hardcore" in fx_style:
-                    motion_type = 0
-                elif "Zufällig" in fx_style:
-                    motion_type = random.choice([0, 1, 2, 3])
-                else:
-                    # Dynamischer Rhythmus-Flow (Abwechslungsreich):
-                    # 0 = Downbeat Heavy (Tilt Shake + Punch + Flash)
-                    # 1 = Crisp Optical Punch-Zoom (NO wobble!) + Flash
-                    # 2 = Directional Pan Snap (Snap slide, NO tilt wobble) + RGB
-                    # 3 = Cinematic Slow Push-In (Smooth glide, NO shake)
-                    motion_type = cut_idx % 4
+                punch_amt = plan["amount"]
+                punch_dur = max(0.01, plan["duration"])
+                whip_amt = plan["amount"] if plan["transform"] == "whip_pan" else 0.0
+                whip_dur = max(0.01, plan["duration"])
+                whip_angle = plan["angle"]
+                flash_amt = plan["flash"]
+                shake_amt = plan["shake"]
+                zoom_blur_amt = plan["zoom_blur"]
 
-                # Alternating direction signs
-                tilt_sign = 1.0 if ((cut_idx // 2) % 2 == 0) else -1.0
-                pan_sign = 1.0 if (cut_idx % 2 == 0) else -1.0
+                has_warp = punch_amt > 0.0005 or whip_amt > 0.0005 or shake_amt > 0.05
+                has_finish = (grain_amount > 0.0) or (allow_vignette and vignette_mask is not None) \
+                    or apply_cinematic_lut or flash_amt > 0.0 or zoom_blur_amt > 0.0
 
-                use_punch = allow_punch and (motion_type in [0, 1])
-                use_shake = allow_shake and cadence_hit and (motion_type == 0) and (dur >= 0.22)
-                use_snap = cadence_hit and (motion_type == 2) and (dur >= 0.18)
-                use_bloom = allow_bloom and cadence_hit and (motion_type in [0, 1, 2])
-                use_rgb = allow_rgb and cadence_hit and (motion_type in [0, 2])
-                use_push = allow_push and (motion_type == 3 or dur > 0.60)
+                if not has_warp and not has_finish:
+                    return clip
+
+                need_margin = whip_amt > 0.0 or punch_amt > 0.02 or shake_amt > 0.05
+                # Rand nur solange noetig, wie wirklich etwas transformiert wird
+                margin_until = 0.0
+                if need_margin:
+                    margin_until = max(punch_dur if punch_amt > 0.02 else 0.0,
+                                       whip_dur if whip_amt > 0.0 else 0.0,
+                                       0.10 if shake_amt > 0.05 else 0.0)
+                grain_field = build_grain_field(th, tw, grain_amount, render_seed + 13)
+                grain_counter = [0]
 
                 def process_frame(gf, t):
                     frame = gf(t)
 
-                    # 1. Spatial Transformation
-                    decay_zoom = ((max(0.0, 1.0 - (t / max(0.001, pz)))) ** 3.0)
-                    cur_zoom = 1.0
-                    if use_punch:
-                        cur_zoom += (0.11 * intensity * decay_zoom)
-                    if use_push:
-                        cur_zoom += (0.038 * (t / dur))
+                    # Whip-Pan und Punch-In brauchen Rand, sonst sieht man
+                    # beim Verschieben die Bildkante.
+                    if need_margin and t < margin_until:
+                        margin = 1.0 + max(whip_amt * 1.6, punch_amt * 1.4, shake_amt / 60.0 + 0.02)
+                        if margin > 1.005:
+                            mh = int(round(tw * margin))
+                            frame = cv2.resize(frame, (mh, mh), interpolation=cv2.INTER_LINEAR)
+                            xo = (mh - tw) // 2
+                            yo = (mh - th) // 2
+                            frame = frame[yo:yo + th, xo:xo + tw]
+                            if frame.shape[0] != th or frame.shape[1] != tw:
+                                frame = cv2.resize(frame, (tw, th), interpolation=cv2.INTER_LINEAR)
 
+                    zoom = 1.0
+                    dx = 0.0
+                    dy = 0.0
                     ang = 0.0
-                    dx, dy = 0.0, 0.0
 
-                    # Heavy Recoil Shake with alternating Tilt (Downbeats only!)
-                    if use_shake and t < sd:
-                        decay_shake = ((max(0.0, 1.0 - (t / sd))) ** 2.4)
-                        ang = np.sin(t * 36.0) * (2.2 * intensity * tilt_sign) * decay_shake
-                        dx = np.sin(t * 48.0) * (14.0 * intensity * pan_sign) * decay_shake
-                        dy = np.cos(t * 38.0) * (10.0 * intensity) * decay_shake
+                    # Punch-In / Punch-Out: Peak bei t=0, Ease-Out
+                    if punch_amt > 0.0005 and t < punch_dur:
+                        prog = max(0.0, 1.0 - t / punch_dur)
+                        ease = prog * prog * (3.0 - 2.0 * prog)
+                        if plan["transform"] == "punch_out":
+                            zoom = 1.0 - (punch_amt * ease)
+                        else:
+                            zoom = 1.0 + (punch_amt * ease)
 
-                    # Directional Snap (Fast horizontal whip, zero tilt!)
-                    elif use_snap and t < 0.12:
-                        decay_snap = ((max(0.0, 1.0 - (t / 0.12))) ** 3.0)
-                        dx = (20.0 * intensity * pan_sign) * decay_snap
+                    # Whip-Pan: linearer Versatz mit Bewegungsunschärfe
+                    if whip_amt > 0.0 and t < whip_dur:
+                        prog = max(0.0, 1.0 - t / whip_dur)
+                        ease = prog * prog * (3.0 - 2.0 * prog)
+                        sign = 1.0 if whip_angle == 0.0 else -1.0
+                        dx = sign * whip_amt * tw * ease
 
-                    if abs(ang) > 0.01 or cur_zoom > 1.002 or abs(dx) > 0.5 or abs(dy) > 0.5:
-                        M = cv2.getRotationMatrix2D((tw / 2.0, th / 2.0), ang, cur_zoom)
+                    # Kurzes, schnelles Shake auf starken Akzenten
+                    if shake_amt > 0.05 and t < 0.10:
+                        decay = (max(0.0, 1.0 - t / 0.10)) ** 2.2
+                        dx += np.sin(t * 52.0) * shake_amt * decay
+                        dy += np.cos(t * 44.0) * shake_amt * 0.7 * decay
+
+                    if abs(zoom - 1.0) > 0.0008 or abs(dx) > 0.4 or abs(dy) > 0.4 or abs(ang) > 0.01:
+                        M = cv2.getRotationMatrix2D((tw / 2.0, th / 2.0), ang, zoom)
                         M[0, 2] += dx
                         M[1, 2] += dy
-                        frame = cv2.warpAffine(frame, M, (tw, th), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+                        frame = cv2.warpAffine(
+                            frame, M, (tw, th),
+                            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT
+                        )
 
-                    # 2. Exposure Bloom Flash (scharfe Spitze auf dem Transient)
-                    if use_bloom and t < fd:
-                        decay_fl = ((max(0.0, 1.0 - (t / fd))) ** 3.0) * intensity
-                        gain = 1.0 + (0.85 * decay_fl)
-                        warm_tint = np.array([255, 246, 225], dtype=np.float32)
-                        boosted = frame.astype(np.float32) * gain + (warm_tint * (0.25 * decay_fl))
-                        frame = np.clip(boosted, 0, 255).astype(np.uint8)
+                    # Bewegungsunschärfe nur waehrend des Whip-Pans
+                    if whip_amt > 0.0 and 0.0 <= t < whip_dur:
+                        prog = max(0.0, 1.0 - t / whip_dur)
+                        blur_len = int(round(3 + 9 * prog))
+                        if blur_len >= 3:
+                            frame = motion_blur_frame(frame, blur_len, whip_angle)
 
-                    # 3. Radial Lens Chromatic Aberration (RGB-Linsenzerlegung)
-                    if use_rgb and t < rd:
-                        decay_rgb = ((max(0.0, 1.0 - (t / rd))) ** 2.0) * intensity
-                        if decay_rgb > 0.02:
-                            r_scale = 1.0 + (0.014 * decay_rgb)
-                            b_scale = 1.0 - (0.014 * decay_rgb)
-                            Mr = cv2.getRotationMatrix2D((tw / 2.0, th / 2.0), 0, r_scale)
-                            Mb = cv2.getRotationMatrix2D((tw / 2.0, th / 2.0), 0, b_scale)
-                            r_ch = cv2.warpAffine(frame[:, :, 0], Mr, (tw, th), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
-                            b_ch = cv2.warpAffine(frame[:, :, 2], Mb, (tw, th), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
-                            frame[:, :, 0] = r_ch
-                            frame[:, :, 2] = b_ch
+                    # Zoom-Blur-Burst auf dem Drop
+                    if zoom_blur_amt > 0.0 and t < 0.22:
+                        prog = max(0.0, 1.0 - t / 0.22)
+                        frame = radial_zoom_blur(frame, zoom_blur_amt * prog)
 
-                    # 4. Bass-Pulse (Full-Frame Kick-Darkening)
-                    if kick_strength > 0.12 and t < 0.16:
-                        bp = (max(0.0, 1.0 - (t / 0.16)) ** 2.0) * kick_strength * intensity
-                        if bp > 0.015:
-                            dim = 1.0 - (0.34 * bp)
-                            tint = np.array([1.0 - (0.18 * bp), 1.0 - (0.30 * bp), 1.0 - (0.05 * bp)], dtype=np.float32)
-                            frame = np.clip(frame.astype(np.float32) * dim * tint, 0, 255).astype(np.uint8)
+                    # Flash: 2-3 Frames, Peak exakt auf dem Transient
+                    if flash_amt > 0.0 and t < 0.05:
+                        prog = max(0.0, 1.0 - t / 0.05)
+                        gain = flash_amt * (prog ** 1.6)
+                        if gain > 0.004:
+                            frame = np.clip(
+                                frame.astype(np.float32) * (1.0 + gain * 1.6)
+                                + (255.0 * gain * 0.30),
+                                0, 255
+                            ).astype(np.uint8)
 
-                    # 5. Cinematic Vignette
+                    # --- Finishing: das, was fertig aussehen laesst ---
                     if allow_vignette and vignette_mask is not None:
                         frame = cv2.multiply(frame, vignette_mask, scale=1.0 / 255.0)
 
-                    # 6. Cinematic S-Curve Contrast & Color Pop LUT
                     if apply_cinematic_lut:
                         frame = cv2.LUT(frame, CINEMATIC_LUT)
+
+                    if grain_amount > 0.0:
+                        frame = apply_film_grain(frame, grain_field, grain_counter[0])
+                        grain_counter[0] += 1
 
                     return frame
 
                 return clip.fl(process_frame)
-
             # Spinning Overlay Compositor
             def apply_spinning_overlay(clip, cur_cut_idx, cut_global_start, dur):
                 if prepared_token is None:
@@ -4117,11 +4433,115 @@ class EditMakerApp(ctk.CTk):
                 clip_audio_vol = 0.0
 
             cpu_threads = max(4, min(16, os.cpu_count() or 4))
+            video_paths = self.video_paths
             clip_idx = 0
             i = 0
             total_dur_count = len(durations)
             clip_loop_t0 = time.time()
             prefix = f"{batch_label} | " if batch_label else ""
+
+            # -------------------------------------------------------------
+            # Collage & Spin (aus dem Original-Repo uebernommen)
+            # Die verbrauchten Beats werden uebersprungen, damit das
+            # Beat-Gitter synchron bleibt.
+            # -------------------------------------------------------------
+            collage_seen = 0
+
+            def build_collage_4(start_idx, steps):
+                """Hintergrund + bis zu 4 Kacheln, die Beat fuer Beat einblenden."""
+                num_steps = min(4, steps)
+                step_durs = [max(float(durations[start_idx + 1 + j]), 0.1) for j in range(num_steps)]
+                total_dur = durations[start_idx] + sum(step_durs)
+
+                bg = fit_clip(source_clip, tw, th).set_duration(total_dur)
+                qw, qh = max(2, tw // 2), max(2, th // 2)
+                quad_positions = [(0, 0), (tw // 2, 0), (0, th // 2), (tw // 2, th // 2)]
+                layers = [bg]
+                extra = []
+
+                t_offset = durations[start_idx]
+                for q in range(num_steps):
+                    q_path = video_paths[(clip_idx + 1 + q) % len(video_paths)]
+                    q_src = open_source(q_path)
+                    extra.append(q_src)
+                    q_rem = sum(step_durs[q:])
+                    tile = fit_clip(cut_source(q_src, q_rem, q_path), qw, qh)
+                    tile = tile.without_audio().set_start(t_offset).set_position(quad_positions[q])
+                    layers.append(tile)
+                    t_offset += step_durs[q]
+
+                comp = CompositeVideoClip(layers, size=(tw, th)).without_audio().set_duration(total_dur)
+                return comp, total_dur, num_steps, extra
+
+            def build_collage_16(start_idx, steps):
+                """4x4-Raster, 4 Kacheln pro Beat."""
+                num_steps = min(4, max(1, steps // 4))
+                step_durs = [max(float(durations[start_idx + 1 + j]), 0.1) for j in range(num_steps)]
+                total_dur = durations[start_idx] + sum(step_durs)
+
+                bg = fit_clip(source_clip, tw, th).set_duration(total_dur)
+                gw, gh = max(2, tw // 4), max(2, th // 4)
+                grid_positions = [(c * gw, r * gh) for r in range(4) for c in range(4)]
+                layers = [bg]
+                extra = []
+
+                t_offset = durations[start_idx]
+                tile_idx = 0
+                for step in range(num_steps):
+                    step_rem = sum(step_durs[step:])
+                    for _ in range(4):
+                        if tile_idx >= 16:
+                            break
+                        t_path = video_paths[(clip_idx + 1 + tile_idx) % len(video_paths)]
+                        t_src = open_source(t_path)
+                        extra.append(t_src)
+                        tile = fit_clip(cut_source(t_src, step_rem, t_path), gw, gh)
+                        tile = tile.without_audio().set_start(t_offset).set_position(grid_positions[tile_idx])
+                        layers.append(tile)
+                        tile_idx += 1
+                    t_offset += step_durs[step]
+
+                comp = CompositeVideoClip(layers, size=(tw, th)).without_audio().set_duration(total_dur)
+                return comp, total_dur, num_steps, extra
+
+            def build_spin(start_idx, steps):
+                src = fit_clip(source_clip, tw, th)
+                dur = durations[start_idx]
+
+                def spin_frame(gf, t):
+                    frame = gf(t)
+                    angle = (t / max(0.01, dur)) * 360.0
+                    img = PIL.Image.fromarray(frame)
+                    return np.array(img.rotate(-angle, resample=PIL.Image.BILINEAR))
+
+                spun = src.fl(spin_frame)
+                big = spun.resize(1.42)
+                return big.crop(
+                    x_center=big.w / 2, y_center=big.h / 2, width=tw, height=th
+                ).without_audio().set_duration(dur), dur, 0, []
+
+            def write_segment(clip_to_write, seg_has_audio=False):
+                temp_path = os.path.join(temp_dir, f"seg_{len(temp_files):04d}.mp4")
+                write_args = {
+                    "fps": fps,
+                    "codec": "libx264",
+                    "threads": cpu_threads,
+                    "logger": None,
+                    "ffmpeg_params": [
+                        "-preset", preset_val,
+                        "-crf", crf_val,
+                        "-tune", "film",
+                        "-pix_fmt", "yuv420p"
+                    ]
+                }
+                if seg_has_audio:
+                    write_args["audio_codec"] = "aac"
+                clip_to_write.write_videofile(temp_path, **write_args)
+                temp_files.append(temp_path)
+                try:
+                    clip_to_write.close()
+                except Exception:
+                    pass
 
             while i < total_dur_count:
                 if self.is_cancelled:
@@ -4134,6 +4554,9 @@ class EditMakerApp(ctk.CTk):
                 cut_global_start = clean_frame_indices[i] / float(fps)
                 cur_path = video_paths[clip_idx]
                 source_clip = open_source(cur_path)
+
+                # Der Drop-Cut bekommt den Zoom-Blur-Burst und optional ein Freeze
+                is_drop_cut = (active_drop_index is not None and clean_frame_indices[i] == active_drop_index)
 
                 # Determine effect mode for this clip
                 use_speedramp = allow_speedramp and not isinstance(source_clip, ImageClip) and (duration < 0.8) and (i % 3 == 0)
@@ -4149,8 +4572,88 @@ class EditMakerApp(ctk.CTk):
                     raw_cut = cut_source(source_clip, duration, cur_path)
                     sub_clip = fit_clip(raw_cut, tw, th)
 
-                # Apply Pro Effects with diverse rhythmic cadence
-                sub_clip = apply_pro_effects(sub_clip, duration, cut_idx=i, cut_global_start=cut_global_start)
+                # Freeze-Frame direkt auf dem Drop (2-3 Frames stehen bleiben)
+                if is_drop_cut and fx_cfg.get("freeze_on_drop") and not isinstance(source_clip, ImageClip):
+                    try:
+                        freeze_t = min(2.5 / float(fps), duration * 0.35)
+                        held = sub_clip.to_ImageClip(t=0, duration=freeze_t)
+                        rest = sub_clip.subclip(freeze_t, duration)
+                        sub_clip = concatenate_videoclips(
+                            [held, rest if rest.duration > 0.01 else sub_clip.to_ImageClip(t=0, duration=duration - freeze_t)],
+                            method="chain"
+                        ).set_duration(duration)
+                    except Exception:
+                        pass
+
+                # Effekte anwenden
+                sub_clip = apply_pro_effects(
+                    sub_clip, duration, cut_idx=i,
+                    cut_global_start=cut_global_start, is_drop_cut=is_drop_cut
+                )
+
+                # Collage / Spin - verbrauchen mehrere Beats, das Gitter bleibt synchron
+                available_after = total_dur_count - i - 1
+                do_16 = (
+                    collage_prob > 0.0 and available_after >= 4
+                    and collage_seen < 3 and effect_rng.random() < (collage_prob * 0.45)
+                )
+                do_collage = (
+                    not do_16 and collage_prob > 0.0 and available_after >= 1
+                    and collage_seen < 5 and effect_rng.random() < collage_prob
+                )
+                do_spin = (
+                    not do_16 and not do_collage and spin_prob > 0.0
+                    and effect_rng.random() < spin_prob
+                )
+
+                if do_16 or do_collage or do_spin:
+                    label = "Collage"
+                    extra_sources = []
+                    try:
+                        if do_16:
+                            seg_clip, seg_dur, consumed, extra_sources = build_collage_16(i, available_after)
+                            label = "16-Collage"
+                        elif do_collage:
+                            seg_clip, seg_dur, consumed, extra_sources = build_collage_4(i, available_after)
+                            label = "Collage"
+                        else:
+                            seg_clip, seg_dur, consumed, extra_sources = build_spin(i, available_after)
+                            label = "Spin"
+
+                        if has_overlay and (cut_global_start + seg_dur >= active_overlay_start):
+                            seg_clip = apply_spinning_overlay(seg_clip, i, cut_global_start, seg_dur)
+
+                        write_segment(seg_clip, False)
+                        source_clip.close()
+                        for e in extra_sources:
+                            try:
+                                e.close()
+                            except Exception:
+                                pass
+
+                        collage_seen += 1
+                        clip_idx = (clip_idx + 1 + max(0, consumed)) % len(video_paths)
+                        i += 1 + max(0, consumed)
+
+                        pct = 0.20 + (0.68 * (i / total_dur_count))
+                        self.set_status(
+                            f"{prefix}Schritt 2/3: {label} ({len(temp_files)}/{total_dur_count})...", pct
+                        )
+                        continue
+                    except Exception as e:
+                        print(f"[{label}] fehlgeschlagen: {e}")
+                        for e2 in extra_sources:
+                            try:
+                                e2.close()
+                            except Exception:
+                                pass
+                        try:
+                            source_clip.close()
+                        except Exception:
+                            pass
+                        source_clip = open_source(cur_path)
+                        raw_cut = cut_source(source_clip, duration, cur_path)
+                        sub_clip = fit_clip(raw_cut, tw, th)
 
                 # Apply Spinning Overlay if clip overlaps or is past active_overlay_start
                 if has_overlay and (cut_global_start + duration >= active_overlay_start):
@@ -4169,30 +4672,9 @@ class EditMakerApp(ctk.CTk):
                 if not seg_has_audio:
                     sub_clip = sub_clip.without_audio()
 
-                temp_path = os.path.join(temp_dir, f"seg_{len(temp_files):04d}.mp4")
-                write_args = {
-                    "fps": fps,
-                    "codec": "libx264",
-                    "threads": cpu_threads,
-                    "logger": None,
-                    "ffmpeg_params": [
-                        "-preset", preset_val,
-                        "-crf", crf_val,
-                        "-tune", "film",
-                        "-pix_fmt", "yuv420p"
-                    ]
-                }
-                if seg_has_audio:
-                    write_args["audio_codec"] = "aac"
-
-                sub_clip.write_videofile(temp_path, **write_args)
-                temp_files.append(temp_path)
+                write_segment(sub_clip, seg_has_audio)
 
                 source_clip.close()
-                try:
-                    sub_clip.close()
-                except Exception:
-                    pass
 
                 clip_idx = (clip_idx + 1) % len(video_paths)
                 i += 1
