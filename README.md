@@ -56,6 +56,12 @@ Ein professionelles Beat-Sync Video-Editing Tool mit moderner CustomTkinter-Ober
   - "Kalibrieren" spielt 12 Klicks, der Nutzer tippt mit, und der Median der Differenz wird als Offset uebernommen und in `app_settings.json` gespeichert.
   - Latenz zusaetzlich per Slider feinjustierbar, Live-Anzeige zeigt bei jedem Tap den Abstand zum naechsten Beat (gruen/gelb/rot) und wie weit der naechste Beat weg ist.
   - Gemessen: Restfehler sinkt von 108 ms auf 0 ms.
+- **Aufnahme-Review nach dem manuellen Schneiden**:
+  - Nach dem Aufnehmen geht es nicht mehr direkt ins Rendern, sondern in eine Pruefansicht.
+  - Wellenform des Auswahlbereichs mit einem Marker pro Cut (gruen = am Beat eingerastet, orange duenn = roher Tap) und Positionsanzeige waehrend der Wiedergabe.
+  - **Audio-Indikatoren**: ein Klickton markiert jeden Cut hoerbar, damit man ohne Rendern hoert, ob der Schnitt sitzt. Abschaltbar.
+  - Zusammenfassung "N Schnitte | X eingerastet | Y frei | Z%" plus Navigation (Von vorn / Zum ersten Cut).
+  - "Zufrieden - rendern" startet den Export, "Neu aufnehmen" verwirft und macht den Recorder erneut auf.
 - **KI Beat-Drop-Erkennung (Machine Learning)**:
   - Agglomerative Segmentierung (Chroma-CQT + MFCC) plus Multi-Band-Change-Point-Analyse.
   - Waehlt den Drop, der in den lautesten Abschnitt fuehrt - nicht den mit dem groessten relativen Sprung.

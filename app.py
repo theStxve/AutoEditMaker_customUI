@@ -319,6 +319,19 @@ def ai_detect_beat_drop(y, sr, total_dur):
     return float(found[0]["time"]) if found else 0.0
 
 
+def compute_waveform_envelope(audio_path, offset=0.0, duration=None, sr=22050, block_s=0.02):
+    """Absolut-Peak-Huelle fuer die Wellenform (ohne Beat-/Drop-Analyse)."""
+    y, _ = librosa.load(audio_path, sr=sr, offset=offset, duration=duration, mono=True)
+    if len(y) < sr // 4:
+        return None, block_s
+    block = max(64, int(sr * block_s))
+    n_blocks = len(y) // block
+    if n_blocks < 2:
+        return None, block_s
+    env = np.abs(y[:n_blocks * block].reshape(n_blocks, block)).max(axis=1)
+    return env, block / float(sr)
+
+
 def snap_beats_to_transients(beat_times, onset_env, sr, hop=512, max_shift=0.06):
     """
     Jitter-Korrektur: Verschiebt jeden Beat auf den staerksten Transient
@@ -2324,12 +2337,14 @@ class EditMakerApp(ctk.CTk):
     def show_info(self, title, msg):
         self._ui_after(0, lambda: messagebox.showinfo(title, msg))
 
-    def _center_window(self, win, min_w=0, min_h=0):
+    def _center_window(self, win, min_w=0, min_h=0, max_w=1200):
         """Fenster mittig auf dem Bildschirm platzieren (auch vor dem Layout)."""
         try:
             win.update_idletasks()
             w = max(min_w, win.winfo_reqwidth(), win.winfo_width())
             h = max(min_h, win.winfo_reqheight(), win.winfo_height())
+            if max_w and w > max_w:
+                w = max_w
             sw = win.winfo_screenwidth()
             sh = win.winfo_screenheight()
             x = max(0, int((sw - w) / 2))
@@ -3444,6 +3459,265 @@ class EditMakerApp(ctk.CTk):
         return win, result
 
     # =====================================================================
+    # Aufnahme-Review: Player mit Waveform + Hit-Indikatoren
+    # =====================================================================
+    def open_manual_review(self, start_t, end_t, out_path, final_beats,
+                           raw_taps, snapped, loose, master_audio_wav, latency_ms=70.0):
+        """
+        Zeigt die Aufnahme zur Kontrolle: Waveform mit einem Marker pro Cut,
+        Playback mit Klick-Indikator an jedem Hit und die Frage, ob's passt.
+        """
+        duration = max(0.5, end_t - start_t)
+        win = ctk.CTkToplevel(self)
+        win.title("Aufnahme pruefen")
+        win.geometry("880x560")
+        win.minsize(760, 480)
+        win.transient(self)
+
+        ctk.CTkLabel(
+            win, text="Ist die Aufnahme in Ordnung?",
+            font=("Arial", 18, "bold")
+        ).pack(pady=(14, 2))
+
+        summary = (
+            f"{len(final_beats) - 2} Schnitte  |  {snapped} eingerastet  |  "
+            f"{loose} frei gesetzt"
+            + (f"  |  {snap_pct:.0f}%" if (snap_pct := (100.0 * snapped / max(1, snapped + loose))) else "")
+        )
+        ctk.CTkLabel(
+            win, text=summary, font=("Arial", 12), text_color="#94a3b8"
+        ).pack(pady=(0, 2))
+
+        ctk.CTkLabel(
+            win,
+            text="Play hoert sich so an, wie der fertige Edit klingen wird. "
+                 "Klick-Indikatoren markieren jeden Cut hoerbar.",
+            font=("Arial", 10), text_color="#64748b", wraplength=640, justify="center"
+        ).pack(pady=(0, 8))
+
+        # --- Waveform ------------------------------------------------
+        wave_wrap = ctk.CTkFrame(win, fg_color="transparent")
+        wave_wrap.pack(fill="x", padx=16)
+
+        wave = Canvas(wave_wrap, height=150, bg="#0b1220",
+                      highlightthickness=1, highlightbackground="#1e293b")
+        wave.pack(fill="x")
+
+        lbl_status = ctk.CTkLabel(win, text="0.0s / 0.0s", font=("Consolas", 12), text_color="#facc15")
+        lbl_status.pack(pady=(4, 0))
+
+        state = {
+            "env": None, "hop": 0.02, "playing": False, "t0": 0.0,
+            "pos": 0.0, "next": 0, "indicators": True, "job": None,
+            "cursor": None,
+        }
+
+        def wave_width():
+            w = wave.winfo_width()
+            if w <= 2:
+                w = wave.winfo_reqwidth()
+            return max(300, w)
+
+        def draw_static():
+            wave.delete("base")
+            w, h = wave_width(), wave.winfo_height()
+            mid = h / 2.0
+            env = state["env"]
+            if env is None or len(env) == 0:
+                return
+            max_v = float(np.percentile(env, 98)) or 1.0
+            top, bot = [], []
+            for x in range(0, w, 1):
+                i0 = int(x / float(w) * duration / state["hop"])
+                i1 = int((x + 1) / float(w) * duration / state["hop"])
+                i0 = max(0, min(len(env) - 1, i0))
+                i1 = max(i0 + 1, min(len(env), i1))
+                seg = env[i0:i1]
+                v = (float(np.max(seg)) / max_v) if len(seg) else 0.0
+                amp = min(1.0, v) * (mid - 4)
+                top.extend((x, mid - amp))
+                bot.extend((x, mid + amp))
+            if top:
+                wave.create_polygon(top + list(reversed(bot)), fill="#1e3a5f", outline="", tags="base")
+
+            # Roh-Taps (orange, duenn) und finale Cuts (gruen, dick)
+            for tap in raw_taps:
+                x = int(tap / duration * w)
+                if 0 <= x < w:
+                    wave.create_line(x, mid - 14, x, mid + 14, fill="#f59e0b", tags="base")
+            for b in final_beats:
+                if b <= 0.001 or b >= duration - 0.001:
+                    continue
+                x = int(b / duration * w)
+                if 0 <= x < w:
+                    wave.create_line(x, 0, x, h, fill="#22c55e", width=2, tags="base")
+                    wave.create_oval(x - 4, 4, x + 4, 12, fill="#22c55e", outline="", tags="base")
+
+        def draw_cursor():
+            if state["cursor"] is not None:
+                wave.delete(state["cursor"])
+                state["cursor"] = None
+            w, h = wave_width(), wave.winfo_height()
+            x = int(state["pos"] / duration * w)
+            if 0 <= x < w:
+                state["cursor"] = wave.create_line(
+                    x, 0, x, h, fill="#facc15", width=2, tags="cur"
+                )
+
+        def set_pos(p):
+            state["pos"] = max(0.0, min(duration, p))
+            lbl_status.configure(text=f"{state['pos']:.1f}s / {duration:.1f}s")
+            draw_cursor()
+
+        def stop_playback():
+            state["playing"] = False
+            if state["job"] is not None:
+                try:
+                    win.after_cancel(state["job"])
+                except Exception:
+                    pass
+                state["job"] = None
+            try:
+                pygame.mixer.music.stop()
+            except Exception:
+                pass
+            btn_play.configure(text="Abspielen", fg_color="#1f8a4c", hover_color="#176b3b")
+
+        click_sound = build_metronome_click()
+
+        def tick():
+            if not state["playing"]:
+                return
+            elapsed = time.perf_counter() - state["t0"]
+            if elapsed >= duration:
+                set_pos(0.0)
+                stop_playback()
+                return
+
+            # Audio-Indikator an jedem Cut, vor dem Ohr des Nutzers
+            if state["indicators"] and click_sound is not None:
+                while state["next"] < len(final_beats):
+                    mark = final_beats[state["next"]]
+                    if mark > elapsed:
+                        break
+                    if mark >= 0.05 and mark <= duration - 0.05:
+                        click_sound.play()
+                    state["next"] += 1
+
+            set_pos(elapsed)
+            state["job"] = win.after(20, tick)
+
+        def start_playback():
+            stop_playback()
+            try:
+                pygame.mixer.music.load(master_audio_wav)
+                pygame.mixer.music.play()
+            except Exception as e:
+                self.show_error("Fehler", f"Preview nicht moeglich:\n{e}")
+                return
+            state["playing"] = True
+            state["t0"] = time.perf_counter()
+            state["next"] = 0
+            btn_play.configure(text="Stopp", fg_color="#8b1e1e", hover_color="#631414")
+            state["job"] = win.after(20, tick)
+
+        # --- Transport ------------------------------------------------
+        btn_play = ctk.CTkButton(
+            win, text="Abspielen", command=lambda: (stop_playback() if state["playing"] else start_playback()),
+            fg_color="#1f8a4c", hover_color="#176b3b", width=140, height=38,
+            font=("Arial", 13, "bold")
+        )
+        btn_play.pack(side="left", padx=(16, 0), pady=(10, 0))
+
+        ind_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            win, text="Audio-Indikatoren (Klick je Cut)", variable=ind_var,
+            command=lambda: state.update(indicators=ind_var.get())
+        ).pack(side="left", padx=14, pady=(10, 0))
+
+        ctk.CTkButton(
+            win, text="Von vorn", command=lambda: set_pos(0.0),
+            fg_color="#334155", hover_color="#475569", width=120, height=38
+        ).pack(side="left", padx=6, pady=(10, 0))
+
+        ctk.CTkButton(
+            win, text="Zum ersten Cut", command=lambda: set_pos(final_beats[1] if len(final_beats) > 1 else 0.0),
+            fg_color="#334155", hover_color="#475569", width=150, height=38
+        ).pack(side="left", padx=6, pady=(10, 0))
+
+        # --- Entscheidung ---------------------------------------------
+        decision = ctk.CTkFrame(win, fg_color="transparent")
+        decision.pack(fill="x", padx=16, pady=(12, 8))
+
+        ctk.CTkLabel(
+            decision,
+            text="Nicht zufrieden? Neu aufnehmen verwirft die bisherigen Cuts.",
+            font=("Arial", 10), text_color="#94a3b8", wraplength=300, justify="right"
+        ).pack(side="left")
+
+        def accept():
+            stop_playback()
+            win.destroy()
+            self.set_status(
+                f"Generiere Video aus {len(final_beats) - 2} manuellen Schnitten "
+                f"({snapped} am Beat eingerastet, {loose} frei)...", 0.1
+            )
+            render_settings = self.collect_render_settings()
+            threading.Thread(
+                target=self.generate_edit,
+                args=(start_t, end_t, out_path, final_beats, "manual",
+                      master_audio_wav, False, None, render_settings),
+                daemon=True
+            ).start()
+
+        def redo():
+            stop_playback()
+            win.destroy()
+            self._set_render_buttons(False)
+            self.set_status("Aufnahme verwerfen und neu starten...", 0.0)
+            self._ui_after(0, lambda: self.open_manual_recorder(start_t, end_t, out_path))
+
+        def discard():
+            stop_playback()
+            win.destroy()
+            shutil.rmtree(os.path.dirname(master_audio_wav), ignore_errors=True)
+            self._set_render_buttons(False)
+            self.set_status("Aufnahme verworfen.", 0.0)
+
+        ctk.CTkButton(
+            decision, text="Neu aufnehmen", command=redo,
+            fg_color="#8b1e1e", hover_color="#631414", width=160, height=42
+        ).pack(side="right", padx=6)
+
+        ctk.CTkButton(
+            decision, text="Zufrieden - rendern", command=accept,
+            fg_color="#1f8a4c", hover_color="#176b3b", width=220, height=42,
+            font=("Arial", 14, "bold")
+        ).pack(side="right", padx=6)
+
+        wave.bind("<Configure>", lambda e: (draw_static(), draw_cursor()))
+        win.protocol("WM_DELETE_WINDOW", discard)
+
+        def _load_wave():
+            try:
+                env, hop = compute_waveform_envelope(master_audio_wav, 0.0, duration)
+            except Exception as e:
+                print(f"[Review] Waveform nicht ladbar: {e}")
+                env, hop = None, 0.02
+
+            def _apply():
+                state["env"] = env
+                state["hop"] = hop
+                draw_static()
+                draw_cursor()
+
+            self._ui_after(0, _apply)
+
+        threading.Thread(target=_load_wave, daemon=True).start()
+        self._center_window(win, min_w=760, min_h=500, max_w=980)
+        return win
+
+    # =====================================================================
     # Manual Recording Mode (Takt-Magnet)
     # =====================================================================
     def open_manual_recorder(self, start_t, end_t, out_path):
@@ -3689,16 +3963,13 @@ class EditMakerApp(ctk.CTk):
                 if final_beats[-1] < total_duration:
                     final_beats.append(total_duration)
 
-                self.set_status(
-                    f"Generiere Video aus {len(final_beats) - 2} manuellen Schnitten "
-                    f"({snapped} am Beat eingerastet, {loose} frei)...", 0.1
+                # Erst pruefen lassen, dann rendern
+                self.set_status(f"{len(final_beats) - 2} Schnitte erkannt - bitte pruefen.", 0.0)
+                self.open_manual_review(
+                    start_t, end_t, out_path, final_beats, raw_sorted,
+                    snapped, loose, master_audio_wav,
+                    latency_ms=float(latency_var.get())
                 )
-                render_settings = self.collect_render_settings()
-                threading.Thread(
-                    target=self.generate_edit,
-                    args=(start_t, end_t, out_path, final_beats, "manual", master_audio_wav, False, None, render_settings),
-                    daemon=True
-                ).start()
             else:
                 shutil.rmtree(temp_dir, ignore_errors=True)
                 self.set_status("Aufnahme abgebrochen (keine Schnitte erfasst).", 0.0)
