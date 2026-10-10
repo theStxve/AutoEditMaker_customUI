@@ -530,7 +530,8 @@ DEFAULT_PRESETS = {
         "ai_reframe": False,
         "auto_loudness": True,
         "snap_jitter": True,
-        "preroll": "Aus (Edit startet am Drop)"
+        "preroll": "8 Beats davor (2 Takte)",
+        "fx_cadence": "Jeder 2. Cut (Sauberer Takt)"
         },
     "Velocity / Action Edit": {
         "mode": "onsets",
@@ -563,7 +564,8 @@ DEFAULT_PRESETS = {
         "ai_reframe": False,
         "auto_loudness": True,
         "snap_jitter": True,
-        "preroll": "Aus (Edit startet am Drop)"
+        "preroll": "4 Beats davor (1 Takt)",
+        "fx_cadence": "Jeder Cut (Maximal)"
         },
     "Cinematic Flow & Aesthetic": {
         "mode": "auto",
@@ -596,7 +598,8 @@ DEFAULT_PRESETS = {
         "ai_reframe": False,
         "auto_loudness": True,
         "snap_jitter": True,
-        "preroll": "Aus (Edit startet am Drop)"
+        "preroll": "16 Beats davor (4 Takte)",
+        "fx_cadence": "Jeder 2. Cut (Sauberer Takt)"
         },
     "Clean & Minimal (Pure Cuts)": {
         "mode": "auto",
@@ -629,7 +632,8 @@ DEFAULT_PRESETS = {
         "ai_reframe": False,
         "auto_loudness": True,
         "snap_jitter": True,
-        "preroll": "Aus (Edit startet am Drop)"
+        "preroll": "Aus (Edit startet am Drop)",
+        "fx_cadence": "Jeder 4. Cut (Nur Akzente)"
         }
 }
 
@@ -669,6 +673,7 @@ class EditMakerApp(ctk.CTk):
         self.render_finished.set()
 
         self.wave_analysis_running = False
+        self._done_win = None
 
         self.presets_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "presets.json")
         self.all_presets = self._load_presets_from_disk()
@@ -983,18 +988,20 @@ class EditMakerApp(ctk.CTk):
         preroll_row = ctk.CTkFrame(sync_frame, fg_color="transparent")
         preroll_row.pack(fill="x", padx=12, pady=(2, 4))
 
-        ctk.CTkLabel(preroll_row, text="Drop-Pre-Roll:").pack(side="left", padx=(0, 8))
-        self.preroll_var = ctk.StringVar(value="Aus (Edit startet am Drop)")
+        ctk.CTkLabel(preroll_row, text="Drop-Pre-Roll / Intro:").pack(side="left", padx=(0, 8))
+        self.preroll_var = ctk.StringVar(value="16 Beats davor (4 Takte)")
         ctk.CTkOptionMenu(
             preroll_row,
             values=[
                 "Aus (Edit startet am Drop)",
                 "2 Beats davor",
                 "4 Beats davor (1 Takt)",
-                "8 Beats davor (2 Takte)"
+                "8 Beats davor (2 Takte)",
+                "16 Beats davor (4 Takte)",
+                "32 Beats davor (8 Takte)"
             ],
             variable=self.preroll_var,
-            width=230
+            width=250
         ).pack(side="left", padx=5)
 
         ctk.CTkLabel(preroll_row, text="Best-Moment-Länge:").pack(side="left", padx=(18, 8))
@@ -1131,7 +1138,20 @@ class EditMakerApp(ctk.CTk):
                 "Dezent & Sanft (Nur weiche Übergänge)"
             ],
             variable=self.combo_fx_style,
-            width=390
+            width=330
+        ).pack(side="left", padx=5)
+
+        ctk.CTkLabel(preset_row, text="Impact-Rhythmus:").pack(side="left", padx=(10, 6))
+        self.fx_cadence_var = ctk.StringVar(value="Jeder 2. Cut (Sauberer Takt)")
+        ctk.CTkOptionMenu(
+            preset_row,
+            values=[
+                "Jeder Cut (Maximal)",
+                "Jeder 2. Cut (Sauberer Takt)",
+                "Jeder 4. Cut (Nur Akzente)"
+            ],
+            variable=self.fx_cadence_var,
+            width=185
         ).pack(side="left", padx=5)
 
         self.fx_cinematic_lut = ctk.BooleanVar(value=True)
@@ -1533,6 +1553,7 @@ class EditMakerApp(ctk.CTk):
         if "overlay_start_mode" in data: self.overlay_start_mode.set(data["overlay_start_mode"])
         if "overlay_circle" in data: self.overlay_circle_cut_var.set(bool(data["overlay_circle"]))
         if "fx_bass_pulse" in data: self.fx_bass_pulse.set(bool(data["fx_bass_pulse"]))
+        if "fx_cadence" in data: self.fx_cadence_var.set(data["fx_cadence"])
         if "ai_reframe" in data: self.ai_reframe_var.set(bool(data["ai_reframe"]))
         if "auto_loudness" in data: self.auto_loudness_var.set(bool(data["auto_loudness"]))
         if "snap_jitter" in data: self.snap_jitter_var.set(bool(data["snap_jitter"]))
@@ -1617,7 +1638,7 @@ class EditMakerApp(ctk.CTk):
             self.fade_out_var, self.combo_fx_style, self.fx_cinematic_lut,
             self.fx_shake, self.fx_bloom_flash, self.fx_punch_zoom,
             self.fx_slow_push, self.fx_rgb_shock, self.fx_vignette,
-            self.fx_speedramp, self.fx_bass_pulse, self.ai_reframe_var,
+            self.fx_speedramp, self.fx_bass_pulse, self.fx_cadence_var, self.ai_reframe_var,
             self.auto_loudness_var, self.snap_jitter_var, self.preroll_var,
             self.enable_overlay_var, self.overlay_corner_var,
             self.overlay_size_var, self.overlay_start_mode,
@@ -1824,6 +1845,97 @@ class EditMakerApp(ctk.CTk):
 
     def show_info(self, title, msg):
         self._ui_after(0, lambda: messagebox.showinfo(title, msg))
+
+    def show_render_done(self, out_path, extra_msg=""):
+        """
+        Fertig-Dialog mit Direktzugriff: ansehen, Ordner oeffnen, schliessen.
+        Kein modaler Messagebox-Block, der den ganzen Workflow stoppt.
+        """
+        def _build():
+            if self._done_win is not None and self._done_win.winfo_exists():
+                try:
+                    self._done_win.destroy()
+                except Exception:
+                    pass
+
+            win = ctk.CTkToplevel(self)
+            self._done_win = win
+            win.title("Fertig")
+            win.geometry("560x290")
+            win.resizable(False, False)
+            win.transient(self)
+            win.attributes("-topmost", True)
+
+            ctk.CTkLabel(
+                win,
+                text="Video erfolgreich gespeichert",
+                font=("Arial", 16, "bold"),
+                text_color="#22c55e"
+            ).pack(pady=(18, 6))
+
+            name_lbl = ctk.CTkLabel(win, text=os.path.basename(out_path), font=("Arial", 12, "bold"))
+            name_lbl.pack(pady=(0, 2))
+
+            path_lbl = ctk.CTkLabel(
+                win, text=os.path.dirname(out_path),
+                text_color="#94a3b8", font=("Arial", 10), wraplength=520, justify="center"
+            )
+            path_lbl.pack(pady=(0, 4))
+
+            if extra_msg:
+                ctk.CTkLabel(win, text=extra_msg, text_color="#38bdf8", font=("Arial", 11)).pack(pady=(0, 6))
+
+            try:
+                dur_txt = ""
+                probe = VideoFileClip(out_path)
+                dur_txt = f"Länge: {probe.duration:.1f}s | {probe.size[0]}x{probe.size[1]}"
+                probe.close()
+                ctk.CTkLabel(win, text=dur_txt, text_color="#94a3b8", font=("Arial", 11)).pack(pady=(0, 8))
+            except Exception:
+                pass
+
+            btn_row = ctk.CTkFrame(win, fg_color="transparent")
+            btn_row.pack(pady=(10, 4))
+
+            def _play():
+                win.destroy()
+                self._done_win = None
+                try:
+                    os.startfile(out_path)
+                except Exception as e:
+                    self.show_error("Fehler", f"Video konnte nicht geoeffnet werden:\n{e}")
+
+            def _open_folder():
+                try:
+                    subprocess.Popen(f'explorer /select,"{os.path.normpath(out_path)}"')
+                except Exception:
+                    os.startfile(os.path.dirname(out_path))
+
+            def _close():
+                win.destroy()
+                self._done_win = None
+
+            ctk.CTkButton(
+                btn_row, text="Direkt ansehen", command=_play,
+                fg_color="#2563eb", hover_color="#1d4ed8", width=170, height=40,
+                font=("Arial", 14, "bold")
+            ).pack(side="left", padx=8)
+
+            ctk.CTkButton(
+                btn_row, text="Ordner oeffnen", command=_open_folder,
+                fg_color="#2b719e", hover_color="#1f5375", width=170, height=40
+            ).pack(side="left", padx=8)
+
+            ctk.CTkButton(
+                btn_row, text="Schliessen", command=_close,
+                fg_color="#444444", hover_color="#555555", width=120, height=40
+            ).pack(side="left", padx=8)
+
+            win.protocol("WM_DELETE_WINDOW", _close)
+            win.after(250, lambda: win.attributes("-topmost", False))
+            return win
+
+        self._ui_after(0, _build)
 
     # =====================================================================
     # Media Selection & Preview
@@ -2286,6 +2398,7 @@ class EditMakerApp(ctk.CTk):
             "allow_vignette": self.fx_vignette.get(),
             "allow_speedramp": self.fx_speedramp.get(),
             "allow_bass_pulse": self.fx_bass_pulse.get(),
+            "fx_cadence": self.fx_cadence_var.get(),
             "enable_snap": self.snap_jitter_var.get(),
             "preroll_choice": self.preroll_var.get(),
             "ai_audio_analysis": self.ai_audio_analysis_var.get(),
@@ -2381,6 +2494,7 @@ class EditMakerApp(ctk.CTk):
 
         def _worker():
             done = 0
+            last_out = None
             for i in range(count):
                 if self.is_cancelled:
                     break
@@ -2397,12 +2511,18 @@ class EditMakerApp(ctk.CTk):
                 )
                 if os.path.exists(out_path):
                     done += 1
+                    last_out = out_path
             self.set_eta("")
             if self.is_cancelled:
                 self.set_status(f"Batch abgebrochen ({done}/{count} fertig).", 0.0)
             else:
                 self.set_status(f"Batch-Export fertig: {done}/{count} Videos in {folder}", 1.0)
-                self.show_info("Fertig", f"{done} Videos wurden exportiert nach:\n{folder}")
+                if last_out and os.path.exists(last_out):
+                    self.show_render_done(
+                        last_out, extra_msg=f"{done} Videos im Ordner:\n{folder}"
+                    )
+                else:
+                    self.show_info("Fertig", f"{done} Videos wurden exportiert nach:\n{folder}")
             self._ui_after(0, lambda: self._set_render_buttons(False))
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -2623,6 +2743,13 @@ class EditMakerApp(ctk.CTk):
             allow_speedramp = cfg["allow_speedramp"]
             allow_bass_pulse = cfg["allow_bass_pulse"]
 
+            # Impact-Cadence: wie oft die Flash-/Shake-Impacts feuern
+            cadence_step = 4
+            if "Jeder Cut" in cfg["fx_cadence"]:
+                cadence_step = 1
+            elif "Jeder 2. Cut" in cfg["fx_cadence"]:
+                cadence_step = 2
+
             # Jitter-Korrektur & Drop-Pre-Roll
             enable_snap = cfg["enable_snap"]
             preroll_choice = cfg["preroll_choice"]
@@ -2834,13 +2961,22 @@ class EditMakerApp(ctk.CTk):
                 preroll_beats = 4
             elif preroll_choice.startswith("8 Beats"):
                 preroll_beats = 8
+            elif preroll_choice.startswith("16 Beats"):
+                preroll_beats = 16
+            elif preroll_choice.startswith("32 Beats"):
+                preroll_beats = 32
 
             if preroll_beats > 0 and drop_timestamp > 0.2 and mode != "manual":
                 inner = [beat_times[k + 1] - beat_times[k] for k in range(len(beat_times) - 1)]
                 inner = [d for d in inner if 0.15 < d < 2.0]
                 beat_len = float(np.median(inner)) if inner else 0.5
                 target = drop_timestamp - (preroll_beats * beat_len)
-                if target > 0.3 and target < total_duration - 1.0:
+                if target <= 0.3:
+                    # Pre-Roll reicht ueber den Trim-Start hinaus: das komplette
+                    # Intro bleibt drin, es wird nur nichts abgeschnitten.
+                    print(f"[Pre-Roll] {preroll_beats} Beats ueber Trim-Start hinaus - ganzes Intro bleibt")
+                    edit_offset = 0.0
+                elif target < total_duration - 1.0:
                     edit_offset = target
                     beat_times = [0.0] + [b - edit_offset for b in beat_times if b > edit_offset + 0.02]
                     drop_timestamp -= edit_offset
@@ -3048,9 +3184,13 @@ class EditMakerApp(ctk.CTk):
             # Modern High-Impact Edit Effect Engine (Rhythm-Aware)
             # =========================================================
             def apply_pro_effects(clip, dur, cut_idx=0, cut_global_start=0.0):
-                fd = min(0.14, dur)
-                sd = min(0.18, dur)
-                rd = min(0.08, dur)
+                # Effekt-Dauern an die Cut-Laenge koppeln: bei schnellen
+                # 2x-Edits darf der Flash nicht in den naechsten Beat laufen,
+                # sonst sieht der Schnitt optisch aus dem Takt gerutscht.
+                fd = min(0.09, dur * 0.22)
+                sd = min(0.10, dur * 0.34)
+                rd = min(0.06, dur * 0.18)
+                pz = min(0.22, dur * 0.6)
 
                 kick_strength = 0.0
                 if allow_bass_pulse and kick_env is not None:
@@ -3063,6 +3203,9 @@ class EditMakerApp(ctk.CTk):
                             kick_strength = float(np.clip(np.max(kick_env[k_idx:k_hi]), 0.0, 1.0))
                     except Exception:
                         kick_strength = 0.0
+
+                # Impact-Cadence: Impact-Effekte nicht auf jedem Cut ausloesen
+                cadence_hit = (cut_idx % cadence_step) == 0
 
                 # Determine Motion Cadence for this cut:
                 if "Dezent" in fx_style:
@@ -3084,17 +3227,17 @@ class EditMakerApp(ctk.CTk):
                 pan_sign = 1.0 if (cut_idx % 2 == 0) else -1.0
 
                 use_punch = allow_punch and (motion_type in [0, 1])
-                use_shake = allow_shake and (motion_type == 0) and (dur >= 0.22)
-                use_snap = (motion_type == 2) and (dur >= 0.18)
-                use_bloom = allow_bloom and (motion_type in [0, 1, 2])
-                use_rgb = allow_rgb and (motion_type in [0, 2])
+                use_shake = allow_shake and cadence_hit and (motion_type == 0) and (dur >= 0.22)
+                use_snap = cadence_hit and (motion_type == 2) and (dur >= 0.18)
+                use_bloom = allow_bloom and cadence_hit and (motion_type in [0, 1, 2])
+                use_rgb = allow_rgb and cadence_hit and (motion_type in [0, 2])
                 use_push = allow_push and (motion_type == 3 or dur > 0.60)
 
                 def process_frame(gf, t):
                     frame = gf(t)
 
                     # 1. Spatial Transformation
-                    decay_zoom = ((max(0.0, 1.0 - (t / dur))) ** 3.0)
+                    decay_zoom = ((max(0.0, 1.0 - (t / max(0.001, pz)))) ** 3.0)
                     cur_zoom = 1.0
                     if use_punch:
                         cur_zoom += (0.11 * intensity * decay_zoom)
@@ -3122,9 +3265,9 @@ class EditMakerApp(ctk.CTk):
                         M[1, 2] += dy
                         frame = cv2.warpAffine(frame, M, (tw, th), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
 
-                    # 2. Exposure Bloom Flash (Highlight-Burst)
+                    # 2. Exposure Bloom Flash (scharfe Spitze auf dem Transient)
                     if use_bloom and t < fd:
-                        decay_fl = ((max(0.0, 1.0 - (t / fd))) ** 2.2) * intensity
+                        decay_fl = ((max(0.0, 1.0 - (t / fd))) ** 3.0) * intensity
                         gain = 1.0 + (0.85 * decay_fl)
                         warm_tint = np.array([255, 246, 225], dtype=np.float32)
                         boosted = frame.astype(np.float32) * gain + (warm_tint * (0.25 * decay_fl))
@@ -3380,7 +3523,7 @@ class EditMakerApp(ctk.CTk):
             self.set_eta("")
             self.set_status(f"Export erfolgreich abgeschlossen: {os.path.basename(out_path)}", 1.0)
             if not batch_label:
-                self.show_info("Fertig", f"Video erfolgreich gespeichert unter:\n{out_path}")
+                self.show_render_done(out_path)
             self._ui_after(0, lambda: self.post_action_frame.pack(fill="x", padx=20, pady=(6, 10)))
 
         except InterruptedError:

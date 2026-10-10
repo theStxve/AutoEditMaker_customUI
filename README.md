@@ -34,7 +34,9 @@ Ein professionelles Beat-Sync Video-Editing Tool mit moderner CustomTkinter-Ober
   - Waehlt den Drop, der in den lautesten Abschnitt fuehrt - nicht den mit dem groessten relativen Sprung.
   - Intro-Regel: beginnt der Song still, gewinnt der erste echte Drop. Snapping auf den Transient.
   - Analysezeit 0.4-1.5s (ohne HPSS, das allein 10s pro Track gekostet haette).
-- **Drop-Pre-Roll**: Edit startet auf Wunsch 2, 4 oder 8 Beats vor dem Drop (Audio wird passend mitverschoben).
+- **Drop-Pre-Roll / Intro**: Edit startet auf Wunsch 2, 4, 8, 16 oder 32 Beats vor dem Drop. Reicht der Pre-Roll ueber den Trim-Start hinaus, bleibt das komplette Intro erhalten. Audio wird per `atrim/asetpts` passend mitverschoben, Bild und Ton bleiben synchron.
+- **Impact-Rhythmus**: Flash-/Shake-Impacts auf jedem Cut, jedem 2. oder nur jedem 4. Cut. Ohne diese Drosselung wirkt ein Flash auf *jedem* schnellen Schnitt, als wuerde das Video aus dem Takt rutschen.
+- **Timing-kopplte Effekt-Dauern**: Bloom-Flash, Bass-Shake, RGB und Punch-Zoom skalieren mit der Laenge des Cuts. Ein 0.14s-Flash auf einem 0.28s-Cut (2x-Tempo) frisst den halben Beat und sieht dadurch aus wie ein Timing-Fehler.
 - **Jitter-Korrektur**: Snappt jeden Beat auf den naechsten echten Transient (+-60ms) - kein Flackern mehr im 2x-Tempo.
 - **Best-Moment-Finder**: findet die energiereichste Passage (15/30/60/90s) und legt den Hook so, dass der Drop in den ersten Sekunden landet.
 - **Wellenform-Ansicht**: Vollstaendige Waveform mit Beat-Gitter, Trim-Bereich und rotem DROP-Marker. Klick setzt den Startpunkt.
@@ -51,7 +53,8 @@ Ein professionelles Beat-Sync Video-Editing Tool mit moderner CustomTkinter-Ober
   - Automatischer 0.8s Fade-Out am Ende gegen abruptes Abreissen.
 - **Prozesskontrolle & Schnellzugriff**:
   - Laufende Rendervorgaenge sauber per Knopfdruck abbrechen.
-  - Nach Fertigstellung direkt den Ausgabeordner oeffnen oder das Video abspielen.
+  - Fertig-Dialog mit **"Direkt ansehen"**, **"Ordner oeffnen"** und **"Schliessen"** statt blockierender Meldungsbox.
+  - Restzeit-ETA im Statusbereich waehrend des Clip-Renders.
 
 ## Installation & Start
 
