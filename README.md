@@ -4,6 +4,30 @@ Ein professionelles Beat-Sync Video-Editing Tool mit moderner CustomTkinter-Ober
 
 ## Highlights & Features
 
+- **Manuelle Cuts als wiederverwendbare Sammlung**:
+  - Der Aufnahme-Review rendert nicht mehr sofort, sondern legt die Cuts in einer
+    Sammlung ab - aufgenommen, millisekundengenau nachjustiert, dann uebernommen.
+  - **Punkt 3 - Beat-Sync & Timing** verwaltet die Sammlung:
+    `Jetzt aufnehmen`, `Verwenden`, `Ccuts ansehen`, `Ccuts verwerfen`.
+  - Einmal aufnehmen, beliebig oft nutzen: **Video Rendern**,
+    **Schnell-Vorschau** und **Batch-Export** verwenden dieselben Cuts.
+  - **Projekt speichern** legt die Cuts in der `.aep` mit ab (Format-Version 3),
+    sodass ein gespeichertes Projekt die Edit-Positionen behaelt.
+  - Sicherheitsregeln: Cuts gelten nur fuer die Musik, zu der sie aufgenommen
+    wurden, nur im gewaehlten Start/Ende-Bereich und nur wenn die Checkbox
+    "Verwenden" gesetzt ist. Sonst wuerde still ein fremder Schnitt benutzt.
+- **Keine Hochskalierung mehr als Standard**:
+  - Aufloesung **"Auto (Quell-Aufloesung)"** ist jetzt Default. Aus 720p-Quellen
+    werden keine 1080p-Bilder mehr erfunden.
+  - Gemessen an der Schaerfe (Varianz des Laplace-Filters, Inhaltsbereich):
+    vorher `82 %` der Quellschaerfe, jetzt `105 %`. Im Crop-Modus `24 %` -> `42 %`.
+  - Im Crop-Modus wird nicht mehr zuerst auf Deckgroesse hochskaliert und dann
+    geschnitten, sondern zuerst in Originalaufloesung der groesste Ausschnitt im
+    Zielformat gesucht und erst danach genau einmal skaliert.
+  - Waehlt man doch eine zu hohe Aufloesung, weist das Programm darauf hin:
+    "Achtung: Quellen sind nur 1280x720 - 1080p erzwingt Hochskalierung".
+  - Der Encoder nutzt `-profile:v high` und adaptives `aq-mode=3` statt
+    `-tune film`, das Kontkanten sichtbar geglaettet hat.
 - **Millisekundengenaue Waveform-Bearbeitung**:
   - **Zoom mit dem Mausrad** in der Haupt-Wellenform und im Aufnahme-Review.
   - **Verschieben mit der mittleren Maustaste**, **Doppelklick = Ansicht zuruecksetzen**.

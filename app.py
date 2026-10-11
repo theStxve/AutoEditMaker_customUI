@@ -995,6 +995,13 @@ class EditMakerApp(ctk.CTk):
         self.audio_duration = 0.0
         self.is_preview_playing = False
         self.manual_times = []
+        # Wiederverwendbare Cut-Sammlung: ueberlebt bis zum Rendern, wird mit dem
+        # Projekt gespeichert und steuert Render, Vorschau und Batch-Export.
+        self.manual_cuts = []
+        self.manual_cuts_audio = None
+        self.manual_cuts_range = None
+        self.manual_cuts_info = {}
+        self.manual_review_source = None
         self.is_cancelled = False
         self.last_rendered_path = None
         self.overlay_img_path = None
@@ -1436,6 +1443,50 @@ class EditMakerApp(ctk.CTk):
             variable=self.preroll_var, width=215
         ).pack(side="left")
 
+        # --- Gespeicherte manuelle Cuts ------------------------------
+        # Die Cuts aus dem Aufnahme-Review landen hier und werden von
+        # Rendern, Schnell-Vorschau und Batch-Export gemeinsam genutzt.
+        cuts_frame = ctk.CTkFrame(sync_frame, fg_color="#0d1526", corner_radius=8)
+        cuts_frame.pack(fill="x", padx=14, pady=(8, 4))
+
+        cuts_row = ctk.CTkFrame(cuts_frame, fg_color="transparent")
+        cuts_row.pack(fill="x", padx=10, pady=(8, 2))
+
+        ctk.CTkLabel(
+            cuts_row, text="Manuelle Cuts:", font=("Arial", 12, "bold")
+        ).pack(side="left", padx=(0, 10))
+
+        self.use_manual_cuts_var = ctk.BooleanVar(value=False)
+        self.chk_manual_cuts = ctk.CTkCheckBox(
+            cuts_row, text="Verwenden", variable=self.use_manual_cuts_var,
+            font=("Arial", 11), command=lambda: self.note_change()
+        )
+        self.chk_manual_cuts.pack(side="left", padx=(0, 10))
+
+        ctk.CTkButton(
+            cuts_row, text="Jetzt aufnehmen", command=self.start_manual_recording,
+            fg_color="#b45309", hover_color="#92400e", width=140, height=32
+        ).pack(side="left", padx=4)
+
+        self.btn_manual_cuts_clear = ctk.CTkButton(
+            cuts_row, text="Ccuts verwerfen", command=self.clear_manual_cuts,
+            fg_color="#8b1e1e", hover_color="#631414", width=140, height=32,
+            state="disabled"
+        )
+        self.btn_manual_cuts_clear.pack(side="left", padx=4)
+
+        ctk.CTkButton(
+            cuts_row, text="Ccuts ansehen", command=self.open_saved_cuts_review,
+            fg_color="#2b719e", hover_color="#1f5375", width=130, height=32
+        ).pack(side="left", padx=4)
+
+        self.lbl_manual_cuts = ctk.CTkLabel(
+            cuts_frame,
+            text="Keine Cuts gespeichert - 'Jetzt aufnehmen' oder im Review 'Ccuts uebernehmen'.",
+            font=("Arial", 10), text_color="#64748b", anchor="w"
+        )
+        self.lbl_manual_cuts.pack(fill="x", padx=10, pady=(0, 8))
+
         candidate_row = ctk.CTkFrame(sync_frame, fg_color="transparent")
         candidate_row.pack(fill="x", padx=14, pady=(2, 4))
 
@@ -1512,12 +1563,22 @@ class EditMakerApp(ctk.CTk):
         ).pack(side="left", padx=(0, 12))
 
         ctk.CTkLabel(row_quality, text="Auflösung:").pack(side="left", padx=(0, 8))
-        self.res_var = ctk.StringVar(value="1080p (Full HD)")
-        ctk.CTkOptionMenu(
+        self.res_var = ctk.StringVar(value="Auto (Quell-Auflösung)")
+        self.combo_res = ctk.CTkOptionMenu(
             row_quality,
-            values=["1080p (Full HD)", "1440p (2K Ultra Sharp)", "Originalgröße der Dateien"],
-            variable=self.res_var, width=185
-        ).pack(side="left")
+            values=["Auto (Quell-Auflösung)", "1080p (Full HD)", "1440p (2K Ultra Sharp)", "Originalgröße der Dateien"],
+            variable=self.res_var, width=185,
+            command=lambda _v: (self.refresh_resolution_warning(), self.note_change())
+        )
+        self.combo_res.pack(side="left", padx=(0, 10))
+
+        # Upscaling erfindet Bildpunkte und sieht sofort weich aus. Der Hinweis
+        # erscheint nur, wenn eine Aufloesung gewaehlt ist, die groesser ist als
+        # die hoechste Quellaufloesung der aktuell geladenen Videos.
+        self.lbl_res_warn = ctk.CTkLabel(
+            row_quality, text="", font=("Arial", 10), text_color="#f59e0b", anchor="w"
+        )
+        self.lbl_res_warn.pack(side="left", fill="x", expand=True)
 
         row_reframe = ctk.CTkFrame(format_frame, fg_color="transparent")
         row_reframe.pack(fill="x", padx=14, pady=(4, 10))
@@ -1974,6 +2035,41 @@ class EditMakerApp(ctk.CTk):
             "preroll": self.preroll_var.get()
         }
 
+    def get_manual_cuts_state(self):
+        """Cut-Sammlung als serialisierbarer Block (Projekt-Speicherung)."""
+        if not self.manual_cuts:
+            return None
+        return {
+            "cuts": [round(float(c), 4) for c in self.manual_cuts],
+            "audio": self.manual_cuts_audio or "",
+            "range": list(self.manual_cuts_range or (0.0, 0.0)),
+            "info": dict(self.manual_cuts_info or {}),
+            "use": bool(self.use_manual_cuts_var.get()),
+        }
+
+    def apply_manual_cuts_state(self, block):
+        if not isinstance(block, dict):
+            self.clear_manual_cuts()
+            return
+        cuts = block.get("cuts") or []
+        try:
+            cuts = [float(c) for c in cuts]
+        except Exception:
+            cuts = []
+        if len(cuts) < 2:
+            self.clear_manual_cuts()
+            return
+        self.manual_cuts = cuts
+        self.manual_cuts_audio = block.get("audio") or None
+        rng = block.get("range") or [0.0, 0.0]
+        try:
+            self.manual_cuts_range = (float(rng[0]), float(rng[1]))
+        except Exception:
+            self.manual_cuts_range = (0.0, 0.0)
+        self.manual_cuts_info = block.get("info") or {}
+        self.use_manual_cuts_var.set(bool(block.get("use", False)))
+        self.refresh_manual_cuts_ui()
+
     def apply_preset_dict(self, data):
         if not isinstance(data, dict):
             return
@@ -2129,6 +2225,7 @@ class EditMakerApp(ctk.CTk):
             "end": float(self.slider_end.get()) if self.audio_duration else 0.0,
             "overlay_img": self.overlay_img_path,
             "overlay_sec": float(self.slider_overlay_sec.get()),
+            "manual_cuts": self.get_manual_cuts_state(),
         }
 
     def apply_full_state(self, state):
@@ -2163,6 +2260,13 @@ class EditMakerApp(ctk.CTk):
             if hasattr(self, 'slider_overlay_sec'):
                 self.slider_overlay_sec.set(sec)
                 self.lbl_overlay_sec.configure(text=f"Start bei: {sec:.1f}s")
+
+            # Cut-Sammlung zuletzt laden: sie vergleicht sich mit der gerade
+            # gesetzten Musikdatei und darf sie also nicht vorher pruefen.
+            if "manual_cuts" in state:
+                self.apply_manual_cuts_state(state.get("manual_cuts"))
+
+            self.refresh_resolution_warning()
             self.draw_waveform()
         finally:
             self._suspend_history = False
@@ -2224,7 +2328,7 @@ class EditMakerApp(ctk.CTk):
 
             data = {
                 "format": "autoedit_project",
-                "version": 2,
+                "version": 3,
                 "settings": self.get_current_settings_dict(),
                 "videos": [_rel(p) for p in self.video_paths],
                 "audio": _rel(self.audio_path),
@@ -2232,6 +2336,7 @@ class EditMakerApp(ctk.CTk):
                 "start": float(self.slider_start.get()) if self.audio_duration else 0.0,
                 "end": float(self.slider_end.get()) if self.audio_duration else 0.0,
                 "overlay_sec": float(self.slider_overlay_sec.get()),
+                "manual_cuts": self.get_manual_cuts_state(),
             }
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=4, ensure_ascii=False)
@@ -2264,6 +2369,11 @@ class EditMakerApp(ctk.CTk):
             missing = [v for v in videos if not os.path.exists(v)]
             videos = [v for v in videos if os.path.exists(v)]
 
+            cuts_block = data.get("manual_cuts")
+            if isinstance(cuts_block, dict):
+                audio_ref = cuts_block.get("audio") or ""
+                cuts_block["audio"] = _abs(audio_ref) or audio_ref
+
             self.apply_full_state({
                 "settings": data.get("settings", {}),
                 "video_paths": videos,
@@ -2272,6 +2382,7 @@ class EditMakerApp(ctk.CTk):
                 "overlay_sec": data.get("overlay_sec", 0.0),
                 "start": data.get("start", 0.0),
                 "end": data.get("end", 0.0),
+                "manual_cuts": cuts_block,
             })
 
             if data.get("audio") and not os.path.exists(_abs(data.get("audio"))):
@@ -2472,7 +2583,148 @@ class EditMakerApp(ctk.CTk):
     def clear_videos(self):
         self.video_paths = []
         self._update_media_listbox()
+        self.refresh_resolution_warning()
         self.note_change()
+
+    def start_manual_recording(self):
+        """Startet die Aufnahme ohne Render - die Cuts landen in der Sammlung."""
+        if not self.audio_path:
+            self.show_error("Hinweis", "Bitte zuerst eine Audio-Datei auswählen.")
+            return
+        if not self.video_paths:
+            self.show_error("Hinweis", "Bitte zuerst mindestens ein Video oder Bild wählen.")
+            return
+        start_t = float(self.slider_start.get())
+        end_t = float(self.slider_end.get())
+        if end_t <= start_t:
+            self.show_error("Fehler", "Das Ende der Musik muss nach dem Start liegen.")
+            return
+
+        out_path = os.path.join(
+            tempfile.gettempdir(),
+            f"autoedit_manual_{int(time.time())}.mp4"
+        )
+        self.is_cancelled = False
+        self._set_render_buttons(True)
+        self.set_status("Aufnahme startet...", 0.05)
+        self.open_manual_recorder(start_t, end_t, out_path)
+
+    def open_saved_cuts_review(self):
+        """Review-Fenster fuer die bereits gespeicherten Cuts erneut oeffnen."""
+        if len(self.manual_cuts) < 2:
+            self.show_info("Hinweis", "Es sind noch keine Cuts gespeichert.\n\n"
+                                      "Nutze 'Jetzt aufnehmen' in Punkt 3.")
+            return
+        if not self.audio_path:
+            self.show_error("Hinweis", "Bitte zuerst die passende Musikdatei wählen.")
+            return
+        if self.manual_cuts_audio and os.path.normcase(os.path.abspath(self.manual_cuts_audio)) != \
+                os.path.normcase(os.path.abspath(self.audio_path)):
+            self.show_info(
+                "Hinweis",
+                "Die gespeicherten Cuts hoeren zu:\n"
+                f"{os.path.basename(self.manual_cuts_audio)}\n\n"
+                "Aktuell geladen ist eine andere Musik. Bitte diese zuerst waehlen."
+            )
+            return
+
+        rng = self.manual_cuts_range or (0.0, self.audio_duration)
+        start_t, end_t = float(rng[0]), float(rng[1])
+        if end_t <= start_t:
+            start_t, end_t = 0.0, float(self.audio_duration)
+
+        temp_dir = tempfile.mkdtemp(prefix="autoedit_saved_cuts_")
+        master_audio_wav = os.path.join(temp_dir, "master_audio.wav")
+        try:
+            cmd = [
+                self.ffmpeg_exe, "-y",
+                "-i", self.audio_path,
+                "-vn",
+                "-ac", "2", "-ar", "44100",
+                "-acodec", "pcm_s16le",
+                master_audio_wav
+            ]
+            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        except Exception as e:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            self.show_error("Fehler", f"Audio konnte nicht vorbereitet werden:\n{e}")
+            return
+
+        from app import compute_waveform_envelope
+        onsets_arr = np.array([])
+        try:
+            y, sr = librosa.load(
+                self.audio_path, sr=22050,
+                offset=start_t, duration=max(1.0, end_t - start_t)
+            )
+            env_low = librosa.onset.onset_strength(y=y, sr=sr, fmax=280)
+            env_high = librosa.onset.onset_strength(y=y, sr=sr, fmin=800, fmax=5500)
+            onset_env = env_low * 1.0 + env_high * 0.65
+            frames = librosa.onset.onset_detect(
+                onset_envelope=onset_env, sr=sr, hop_length=512,
+                backtrack=True, wait=6, delta=0.07
+            )
+            onsets_arr = librosa.frames_to_time(frames, sr=sr, hop_length=512) + start_t
+        except Exception:
+            pass
+
+        self.open_manual_review(
+            start_t, end_t,
+            os.path.join(temp_dir, "unused.mp4"),
+            list(self.manual_cuts), list(self.manual_cuts),
+            self.manual_cuts_info.get("snapped", 0),
+            self.manual_cuts_info.get("loose", 0),
+            master_audio_wav,
+            latency_ms=self.get_manual_latency_ms(),
+            onsets=onsets_arr
+        )
+
+    def source_max_resolution(self):
+        best = (0, 0)
+        for path in list(self.video_paths)[:40]:
+            ext = os.path.splitext(path)[1].lower()
+            try:
+                if ext in ('.png', '.jpg', '.jpeg', '.webp', '.bmp'):
+                    with PIL.Image.open(path) as im:
+                        w, h = im.size
+                else:
+                    probe = VideoFileClip(path)
+                    w, h = probe.size
+                    probe.close()
+                best = max(best, (int(w), int(h)))
+            except Exception:
+                continue
+        return best
+
+    def refresh_resolution_warning(self):
+        lbl = getattr(self, "lbl_res_warn", None)
+        if lbl is None:
+            return
+        choice = self.res_var.get()
+        if "Auto" in choice:
+            lbl.configure(text="")
+            return
+        src_w, src_h = self.source_max_resolution()
+        if src_w <= 0:
+            lbl.configure(text="")
+            return
+        # Hochformat dreht die Achsen - verglichen wird nach der Pixelzahl.
+        src_px = src_w * src_h
+        if "1440p" in choice:
+            want_px = 2560 * 1440
+        elif "1080p" in choice:
+            want_px = 1920 * 1080
+        else:
+            lbl.configure(text="")
+            return
+        if want_px > src_px * 1.02:
+            lbl.configure(
+                text=f"Achtung: Quellen sind nur {src_w}x{src_h} - "
+                     f"{'1440p' if '1440p' in choice else '1080p'} erzwingt Hochskalierung "
+                     f"(sieht weicher aus)."
+            )
+        else:
+            lbl.configure(text="")
 
     def _update_media_listbox(self):
         self.media_listbox.configure(state="normal")
@@ -2524,6 +2776,8 @@ class EditMakerApp(ctk.CTk):
             text=f"{os.path.basename(path)} ({self.audio_duration:.1f}s)",
             text_color="#38bdf8"
         )
+        # Musikwechsel: gespeicherte Cuts koennen zu einer anderen Datei gehoeren.
+        self.refresh_manual_cuts_ui()
         self.btn_audio_preview.configure(state="normal")
 
         self.wave_env = None
@@ -3168,7 +3422,21 @@ class EditMakerApp(ctk.CTk):
             random.shuffle(self.video_paths)
 
         mode = self.mode_var.get()
-        if mode == "manual":
+        saved_cuts = self.effective_manual_cuts()
+        if saved_cuts:
+            # Gespeicherte Cuts sind da -> direkt rendern, egal welcher Modus
+            # gerade gewaehlt ist. So bleibt der Aufnahme-Modus nuetzlich,
+            # ohne jedes Mal neu aufnehmen zu muessen.
+            self.set_status(
+                f"Starte Render mit {len(saved_cuts) - 2} gespeicherten Cuts...", 0.05
+            )
+            render_settings = self.collect_render_settings()
+            threading.Thread(
+                target=self.generate_edit,
+                args=(start_t, end_t, out_path, None, "manual", None, False, None, render_settings),
+                daemon=True
+            ).start()
+        elif mode == "manual":
             self.open_manual_recorder(start_t, end_t, out_path)
         else:
             self.set_status("Starte Beat-Analyse & Vorbereitung...", 0.05)
@@ -3202,6 +3470,7 @@ class EditMakerApp(ctk.CTk):
             "audio_path": self.audio_path,
             "video_paths": list(self.video_paths),
             "overlay_img_path": self.overlay_img_path,
+            "manual_cuts": self.effective_manual_cuts(),
             "orientation": self.orient_var.get(),
             "scale_mode": self.scale_mode_var.get(),
             "pace_choice": self.pace_var.get(),
@@ -3268,8 +3537,14 @@ class EditMakerApp(ctk.CTk):
             return
 
         mode = self.mode_var.get()
-        if mode == "manual":
-            self.show_info("Hinweis", "Im manuellen Modus gibt es keine Schnell-Vorschau. Bitte den normalen Render nutzen.")
+        if mode == "manual" and not self.effective_manual_cuts():
+            self.show_info(
+                "Hinweis",
+                "Im Aufnahme-Modus gibt es keine Schnell-Vorschau.\n\n"
+                "Nimm erst Cuts auf ('Jetzt aufnehmen' in Punkt 3) und "
+                "uebernimm sie mit 'Ccuts uebernehmen' - dann kannst du "
+                "die Vorschau auch im manuellen Modus nutzen."
+            )
             return
 
         self.is_cancelled = False
@@ -3292,8 +3567,15 @@ class EditMakerApp(ctk.CTk):
         start_t, end_t = inputs
 
         mode = self.mode_var.get()
-        if mode == "manual":
-            self.show_info("Hinweis", "Batch-Export ist nur im Auto- oder Onset-Modus verfügbar.")
+        if mode == "manual" and not self.effective_manual_cuts():
+            self.show_info(
+                "Hinweis",
+                "Der Batch-Export braucht either den Auto-/Onset-Modus "
+                "oder gespeicherte Cuts.\n\n"
+                "Nimm Cuts auf ('Jetzt aufnehmen' in Punkt 3) und uebernimm "
+                "sie mit 'Ccuts uebernehmen' - dann laeuft der Batch-Export "
+                "mit deinen Cuts."
+            )
             return
 
         dialog = ctk.CTkInputDialog(
@@ -3926,24 +4208,41 @@ class EditMakerApp(ctk.CTk):
 
         ctk.CTkLabel(
             decision,
-            text="Nicht zufrieden? 'Neu aufnehmen' verwirft die bisherigen Cuts.",
+            text="'Cuts uebernehmen' legt sie in der Sammlung in Punkt 3 ab - "
+                 "dann renderen, oder als Projekt speichern.",
             font=("Arial", 10), text_color="#94a3b8", anchor="w"
         ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
 
         def accept():
             stop_playback()
             win.destroy()
-            self.set_status(
-                f"Generiere Video aus {len(beats_list) - 2} manuellen Schnitten "
-                f"({snapped} am Beat eingerastet, {loose} frei)...", 0.1
+            # Die Cuts werden nicht mehr sofort gerendert, sondern als
+            # wiederverwendbare Sammlung abgelegt. Von dort aus kann der User
+            # rendern, die Vorschau pruefen, den Batch-Export fahren oder das
+            # Projekt speichern und spaeter weiterverwenden.
+            self.store_manual_cuts(
+                list(beats_list),
+                audio_source=self.manual_review_source or self.audio_path,
+                start_t=start_t, end_t=end_t,
+                snapped=snapped, loose=loose
             )
-            render_settings = self.collect_render_settings()
-            threading.Thread(
-                target=self.generate_edit,
-                args=(start_t, end_t, out_path, list(beats_list), "manual",
-                      master_audio_wav, False, None, render_settings),
-                daemon=True
-            ).start()
+            shutil.rmtree(os.path.dirname(master_audio_wav), ignore_errors=True)
+            self._set_render_buttons(False)
+            self.set_status(
+                f"{len(beats_list) - 2} manuelle Cuts gespeichert "
+                f"({snapped} am Beat eingerastet, {loose} frei). "
+                f"Verwenden ueber 'Ccuts' in Punkt 3.", 0.0
+            )
+            self.show_info(
+                "Cuts gespeichert",
+                f"{len(beats_list) - 2} Cuts wurden in der Cut-Sammlung abgelegt.\n\n"
+                f"Du kannst sie jetzt im Hauptfenster unter\n"
+                f"Punkt 3 - Beat-Sync & Timing nutzen:\n\n"
+                f"  • Video Rendern\n"
+                f"  • Schnell-Vorschau\n"
+                f"  • Batch-Export\n\n"
+                f"und mit 'Projekt speichern' dauerhaft ablegen.",
+            )
 
         def redo():
             stop_playback()
@@ -3965,7 +4264,7 @@ class EditMakerApp(ctk.CTk):
         ).grid(row=1, column=0, sticky="e", padx=6)
 
         ctk.CTkButton(
-            decision, text="Zufrieden - rendern", command=accept,
+            decision, text="Cuts uebernehmen", command=accept,
             fg_color="#1f8a4c", hover_color="#176b3b", width=220, height=42,
             font=("Arial", 14, "bold")
         ).grid(row=1, column=1, sticky="e", padx=6)
@@ -3997,7 +4296,94 @@ class EditMakerApp(ctk.CTk):
     # =====================================================================
     # Manual Recording Mode (Takt-Magnet)
     # =====================================================================
+    # =====================================================================
+    # Wiederverwendbare Cut-Sammlung (manueller Modus)
+    # =====================================================================
+    def store_manual_cuts(self, cuts, audio_source=None, start_t=0.0, end_t=None,
+                          snapped=0, loose=0):
+        """Legt gepruefte Cut-Zeiten als wiederverwendbare Sammlung ab."""
+        cleaned = []
+        for c in sorted(float(x) for x in cuts):
+            if cleaned and c <= cleaned[-1] + 1e-4:
+                continue
+            cleaned.append(c)
+        if len(cleaned) < 2:
+            self.show_error("Hinweis", "Es wurden keine brauchbaren Cuts uebernommen.")
+            return False
+        self.manual_cuts = cleaned
+        self.manual_cuts_audio = audio_source or self.audio_path
+        self.manual_cuts_range = (float(start_t), float(end_t if end_t is not None else 0.0))
+        self.manual_cuts_info = {"snapped": int(snapped), "loose": int(loose)}
+        self.refresh_manual_cuts_ui()
+        self.note_change()
+        return True
+
+    def clear_manual_cuts(self):
+        if not self.manual_cuts:
+            return
+        self.manual_cuts = []
+        self.manual_cuts_audio = None
+        self.manual_cuts_range = None
+        self.manual_cuts_info = {}
+        self.refresh_manual_cuts_ui()
+        self.note_change()
+
+    def effective_manual_cuts(self):
+        """
+        Liefert die Cuts, die ein Render tatsaechlich verwenden soll - oder None.
+
+        Gespeicherte Cuts gelten nur fuer die Musik, zu der sie aufgenommen
+        wurden, und nur, wenn sie wirklich im aktuell gewaehlten Bereich liegen.
+        Sonst wuerde ein Projekt mit anderer Musik stille falsche Cuts benutzen.
+        """
+        if not self.use_manual_cuts_var.get() or len(self.manual_cuts) < 2:
+            return None
+        if self.manual_cuts_audio and self.audio_path:
+            a = os.path.normcase(os.path.abspath(self.manual_cuts_audio))
+            b = os.path.normcase(os.path.abspath(self.audio_path))
+            if a != b:
+                return None
+        start_t = float(self.slider_start.get()) if self.audio_duration else 0.0
+        end_t = float(self.slider_end.get()) if self.audio_duration else 0.0
+        inside = [c for c in self.manual_cuts if start_t - 0.05 <= c <= end_t + 0.05]
+        if len(inside) < 2:
+            return None
+        return inside
+
+    def refresh_manual_cuts_ui(self):
+        lbl = getattr(self, "lbl_manual_cuts", None)
+        if lbl is None:
+            return
+        n = len(self.manual_cuts)
+        if n < 2:
+            lbl.configure(
+                text="Keine Cuts gespeichert - 'Manuell aufnehmen' oder im Review 'Ccuts uebernehmen'.",
+                text_color="#64748b"
+            )
+            if hasattr(self, "btn_manual_cuts_clear"):
+                self.btn_manual_cuts_clear.configure(state="disabled")
+            if hasattr(self, "chk_manual_cuts"):
+                self.chk_manual_cuts.deselect()
+            return
+
+        base = os.path.basename(self.manual_cuts_audio) if self.manual_cuts_audio else "?"
+        matches = bool(self.manual_cuts_audio and self.audio_path
+                       and os.path.normcase(os.path.abspath(self.manual_cuts_audio))
+                       == os.path.normcase(os.path.abspath(self.audio_path)))
+        rng = self.manual_cuts_range or (0.0, 0.0)
+        warn = "" if matches else " - ACHTUNG: andere Musik geladen, Cuts werden nicht verwendet"
+        lbl.configure(
+            text=f"{n - 2} Cuts gespeichert  |  {base}  |  {rng[0]:.1f}s - {rng[1]:.1f}s{warn}",
+            text_color="#38bdf8" if matches else "#f59e0b"
+        )
+        if hasattr(self, "btn_manual_cuts_clear"):
+            self.btn_manual_cuts_clear.configure(state="normal")
+        if matches and hasattr(self, "chk_manual_cuts"):
+            self.chk_manual_cuts.select()
+        self.use_manual_cuts_var.set(matches)
+
     def open_manual_recorder(self, start_t, end_t, out_path):
+        self.manual_review_source = self.audio_path
         total_duration = end_t - start_t
         temp_dir = tempfile.mkdtemp(prefix="autoedit_manual_")
         master_audio_wav = os.path.join(temp_dir, "master_audio.wav")
@@ -4264,6 +4650,13 @@ class EditMakerApp(ctk.CTk):
         temp_files = []
         try:
             cfg = settings if settings else self.collect_render_settings()
+            # Gespeicherte manuelle Cuts schlagen die automatische Erkennung -
+            # sie sind bewusst gesetzt und werden fuer Vorschau, Einzelrender
+            # und Batch-Export identisch verwendet.
+            if custom_beat_times is None:
+                custom_beat_times = cfg.get("manual_cuts")
+            elif custom_beat_times is not None and not custom_beat_times:
+                custom_beat_times = None
             total_duration = end_t - start_t
             orientation = cfg["orientation"]
             scale_mode = cfg["scale_mode"]
@@ -4636,6 +5029,9 @@ class EditMakerApp(ctk.CTk):
             # Resolution scaling
             if proxy:
                 base_w, base_h = 480, 854
+            elif "Auto" in res_choice:
+                # Nie ueber die Quelle hinaus: hochskalierte Bilder sehen weich aus.
+                base_w, base_h = max(2, orig_w), max(2, orig_h)
             elif "1440p" in res_choice:
                 base_w, base_h = 2560, 1440
             elif "Original" in res_choice:
@@ -4710,41 +5106,92 @@ class EditMakerApp(ctk.CTk):
             reframer = FaceReframer() if enable_auto_reframe else None
 
             def fit_clip(clip, target_w, target_h):
-                cw, ch = clip.size
-                if scale_mode == "fit":
-                    scale = min(target_w / float(cw), target_h / float(ch))
-                    resized = clip.resize(scale)
-                    return resized.on_color(size=(target_w, target_h), color=(0, 0, 0), pos="center")
+                """
+                Bringt einen Clip auf die Zielgroesse - ohne Bildpunkte zu erfinden.
 
-                scale = max(target_w / float(cw), target_h / float(ch)) * 1.002
-                resized = clip.resize(scale)
-                rw, rh = resized.size
-                half_w = target_w / 2.0
+                Frueher wurde im Crop-Modus zuerst auf die Deckgroesse hochskaliert
+                und danach zugeschnitten. Bei 720p-Quellen im Hochformat bedeutete
+                das ein 1.8x-Upscale, das die Schaerfe sichtbar zerstoerte
+                (Laplacian-Varianz der Quelle 283, im Render nur noch 80-175).
+                Jetzt wird zuerst in Originalaufloesung der groesste moegliche
+                Ausschnitt im Zielformat gesucht, danach genau einmal skaliert.
+
+                Wichtig: Am Ende ist die Groesse garantiert exakt
+                target_w x target_h. Die Effekt-Pipeline rechnet mit festen
+                Masks (Vignette, LUT, Korn) in Zielgroesse - ein abweichendes
+                Zwischenformat laesst cv2 mit mismatched sizes abstuerzen.
+                """
+                cw, ch = clip.size
+                if cw <= 0 or ch <= 0:
+                    return clip
+
+                src_ratio = cw / float(ch)
+                dst_ratio = target_w / float(target_h)
+
+                if scale_mode == "fit":
+                    # Schwarze Balken, aber niemals hochskaliert.
+                    scale = min(target_w / float(cw), target_h / float(ch), 1.0)
+                    resized = clip.resize(scale) if scale < 0.999 else clip
+                    if tuple(resized.size) == (target_w, target_h):
+                        return resized
+                    return resized.on_color(
+                        size=(target_w, target_h), color=(0, 0, 0), pos="center"
+                    )
+
+                # "fill": In Originalaufloesung so gross wie moeglich zuschneiden,
+                # danach erst auf die Zielgroesse bringen.
+                if src_ratio > dst_ratio:
+                    # Quelle ist breiter -> seitlich zuschneiden, Hoehe bleibt
+                    crop_w = min(int(round(ch * dst_ratio)), cw)
+                    crop_h = ch
+                else:
+                    crop_w = cw
+                    crop_h = min(int(round(cw / dst_ratio)), ch)
+
+                left = (cw - crop_w) // 2
+                top = (ch - crop_h) // 2
+                cropped = clip.crop(
+                    x1=left, y1=top, x2=left + crop_w, y2=top + crop_h
+                )
+
+                scale = min(target_w / float(crop_w), target_h / float(crop_h))
+                # Hochskalieren nur, wenn das Ziel es wirklich verlangt (z.B. 1440p).
+                # Ohne das bleiben 720p-Quellen bei 720p statt weich auf 1080p geblowen zu werden.
+                resized = cropped.resize(scale) if abs(scale - 1.0) > 0.001 else cropped
+
+                if tuple(resized.size) == (target_w, target_h):
+                    base = resized
+                else:
+                    # Auf Zielgroesse bringen. Der Rest ist Rundungsrest vom
+                    # Zielformat und wird zentriert weggeschnitten.
+                    base = resized.resize((max(target_w, resized.size[0]),
+                                                max(target_h, resized.size[1])))
+                    lft = max(0, (base.size[0] - target_w) // 2)
+                    ttop = max(0, (base.size[1] - target_h) // 2)
+                    base = base.crop(x1=lft, y1=ttop, x2=lft + target_w, y2=ttop + target_h)
+
+                if tuple(base.size) != (target_w, target_h):
+                    # Letzter Sicherheitsnetz: exakt auf das Zielformat.
+                    base = base.resize((target_w, target_h))
 
                 if reframer is None:
-                    return resized.crop(
-                        x_center=rw / 2.0,
-                        y_center=rh / 2.0,
-                        width=target_w,
-                        height=target_h,
-                    )
+                    return base
 
                 # KI-Auto-Reframe: horizontal verschobener Crop, der dem Gesicht folgt
                 def reframe_picker(gf, t):
                     frame = gf(t)
                     ratio = reframer.track_center(frame)
                     if ratio is None:
-                        cx = rw / 2.0
+                        cx = base.size[0] / 2.0
                     else:
-                        cx = ratio * rw
-                        cx = max(half_w, min(rw - half_w, cx))
-                    left = int(round(cx - half_w))
-                    top = int(round((rh - target_h) / 2.0))
-                    left = max(0, min(rw - target_w, left))
-                    top = max(0, max(0, rh - target_h))
-                    return frame[top:top + target_h, left:left + target_w]
+                        cx = ratio * base.size[0]
+                        cx = max(target_w / 2.0, min(base.size[0] - target_w / 2.0, cx))
+                    lft = int(round(cx - target_w / 2.0))
+                    ttop = max(0, (base.size[1] - target_h) // 2)
+                    lft = max(0, min(base.size[0] - target_w, lft))
+                    return frame[ttop:ttop + target_h, lft:lft + target_w]
 
-                return resized.fl(reframe_picker)
+                return base.fl(reframe_picker)
 
             def open_source(path):
                 ext_ = os.path.splitext(path)[1].lower()
@@ -5105,8 +5552,16 @@ class EditMakerApp(ctk.CTk):
                     "ffmpeg_params": [
                         "-preset", preset_val,
                         "-crf", crf_val,
-                        "-tune", "film",
-                        "-pix_fmt", "yuv420p"
+                        # "-tune film" glaettet Kontkanten sichtbar weg - genau die
+                        # Art von Detailverlust, die man als "schlechte Qualitaet"
+                        # einordnet, obwohl CRF und Aufloesung stimmen. Stattdessen
+                        # aq=3 (adaptiver Quantisierer) fuer mehr Details in
+                        # dunklen und stark bewegten Passagen.
+                        "-profile:v", "high",
+                        "-level", "4.2",
+                        "-pix_fmt", "yuv420p",
+                        "-x264-params", "aq-mode=3:aq-strength=1.0:deblock=-1,-1",
+                        "-movflags", "+faststart",
                     ]
                 }
                 if seg_has_audio:
