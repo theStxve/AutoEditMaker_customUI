@@ -1480,6 +1480,13 @@ class EditMakerApp(ctk.CTk):
             fg_color="#2b719e", hover_color="#1f5375", width=130, height=32
         ).pack(side="left", padx=4)
 
+        self.btn_manual_cuts_range = ctk.CTkButton(
+            cuts_row, text="Bereich laden", command=self.apply_manual_cuts_range,
+            fg_color="#4b5563", hover_color="#374151", width=130, height=32,
+            state="disabled"
+        )
+        self.btn_manual_cuts_range.pack(side="left", padx=4)
+
         self.lbl_manual_cuts = ctk.CTkLabel(
             cuts_frame,
             text="Keine Cuts gespeichert - 'Jetzt aufnehmen' oder im Review 'Ccuts uebernehmen'.",
@@ -3436,6 +3443,23 @@ class EditMakerApp(ctk.CTk):
                 args=(start_t, end_t, out_path, None, "manual", None, False, None, render_settings),
                 daemon=True
             ).start()
+        elif mode == "manual" and len(self.manual_cuts) >= 2:
+            # Es sind Cuts da, sie greifen nur gerade nicht. Nicht stillschweigend
+            # eine neue Aufnahme starten - das sah aus, als waere alles verloren.
+            problem = self.manual_cuts_problem() or "Die gespeicherten Cuts sind nicht verwendbar."
+            extra = ""
+            if "Cuts liegen zwischen" in problem:
+                extra = ("\n\nMit 'Bereich laden' stellst du Start und Ende auf den "
+                         "aufgezeichneten Bereich zurueck.")
+            elif "Verwenden" in problem:
+                extra = "\n\nAktiviere die Checkbox 'Verwenden', um die Cuts zu nutzen."
+            self.show_info(
+                "Cuts vorhanden, aber nicht verwendbar",
+                f"{problem}{extra}\n\n"
+                f"Alternativ kannst du neu aufnehmen - die bisherigen Cuts werden "
+                f"dann durch die neuen ersetzt."
+            )
+            return
         elif mode == "manual":
             self.open_manual_recorder(start_t, end_t, out_path)
         else:
@@ -3538,12 +3562,17 @@ class EditMakerApp(ctk.CTk):
 
         mode = self.mode_var.get()
         if mode == "manual" and not self.effective_manual_cuts():
+            problem = self.manual_cuts_problem()
+            if not problem:
+                problem = "Der Aufnahme-Modus ist gewaehlt."
+            extra = ""
+            if "Cuts liegen zwischen" in problem:
+                extra = ("\n\nMit dem Button 'Bereich laden' in Punkt 3 stellst du "
+                         "Start und Ende auf den aufgezeichneten Bereich zurueck.")
             self.show_info(
                 "Hinweis",
-                "Im Aufnahme-Modus gibt es keine Schnell-Vorschau.\n\n"
-                "Nimm erst Cuts auf ('Jetzt aufnehmen' in Punkt 3) und "
-                "uebernimm sie mit 'Ccuts uebernehmen' - dann kannst du "
-                "die Vorschau auch im manuellen Modus nutzen."
+                f"Die Schnell-Vorschau kann mit deinen Cuts gerade nicht laufen:\n\n"
+                f"{problem}{extra}"
             )
             return
 
@@ -3568,13 +3597,17 @@ class EditMakerApp(ctk.CTk):
 
         mode = self.mode_var.get()
         if mode == "manual" and not self.effective_manual_cuts():
+            problem = self.manual_cuts_problem()
+            if not problem:
+                problem = "Der Aufnahme-Modus ist gewaehlt."
+            extra = ""
+            if "Cuts liegen zwischen" in problem:
+                extra = ("\n\nMit dem Button 'Bereich laden' in Punkt 3 stellst du "
+                         "Start und Ende auf den aufgezeichneten Bereich zurueck.")
             self.show_info(
                 "Hinweis",
-                "Der Batch-Export braucht either den Auto-/Onset-Modus "
-                "oder gespeicherte Cuts.\n\n"
-                "Nimm Cuts auf ('Jetzt aufnehmen' in Punkt 3) und uebernimm "
-                "sie mit 'Ccuts uebernehmen' - dann laeuft der Batch-Export "
-                "mit deinen Cuts."
+                f"Der Batch-Export kann mit deinen Cuts gerade nicht laufen:\n\n"
+                f"{problem}{extra}"
             )
             return
 
@@ -4328,27 +4361,83 @@ class EditMakerApp(ctk.CTk):
         self.refresh_manual_cuts_ui()
         self.note_change()
 
-    def effective_manual_cuts(self):
+    def manual_cuts_absolute(self):
         """
-        Liefert die Cuts, die ein Render tatsaechlich verwenden soll - oder None.
+        Die gespeicherten Cuts in absoluten Sekunden der Musikdatei.
 
-        Gespeicherte Cuts gelten nur fuer die Musik, zu der sie aufgenommen
-        wurden, und nur, wenn sie wirklich im aktuell gewaehlten Bereich liegen.
-        Sonst wuerde ein Projekt mit anderer Musik stille falsche Cuts benutzen.
+        Wichtig: der Recorder speichert relative Zeiten (0 = Start des
+        Aufnahmefensters), weil die Anzeige im Review so arbeitet. Fuer den
+        Bereich-Vergleich brauchen wir aber absolute Zeiten - daher der
+        gespeicherte Aufnahme-Start als Basis.
         """
-        if not self.use_manual_cuts_var.get() or len(self.manual_cuts) < 2:
-            return None
+        base = 0.0
+        if self.manual_cuts_range:
+            try:
+                base = float(self.manual_cuts_range[0])
+            except Exception:
+                base = 0.0
+        return [base + float(c) for c in self.manual_cuts]
+
+    def manual_cuts_problem(self):
+        """
+        Leerer String, wenn die gespeicherten Cuts verwendbar sind - sonst der
+        konkrete Grund. Ohne diese Meldung bekam man nur 'nimm erst Cuts auf',
+        obwohl 29 Cuts in der Sammlung lagen.
+        """
+        if len(self.manual_cuts) < 2:
+            return "Es sind noch keine Cuts gespeichert."
         if self.manual_cuts_audio and self.audio_path:
             a = os.path.normcase(os.path.abspath(self.manual_cuts_audio))
             b = os.path.normcase(os.path.abspath(self.audio_path))
             if a != b:
-                return None
-        start_t = float(self.slider_start.get()) if self.audio_duration else 0.0
-        end_t = float(self.slider_end.get()) if self.audio_duration else 0.0
-        inside = [c for c in self.manual_cuts if start_t - 0.05 <= c <= end_t + 0.05]
+                return (f"Die Cuts gehoeren zu '{os.path.basename(self.manual_cuts_audio)}', "
+                        f"geladen ist '{os.path.basename(self.audio_path)}'.")
+        if not self.use_manual_cuts_var.get():
+            return "Die Checkbox 'Verwenden' ist nicht gesetzt."
+        if not self.audio_duration:
+            return "Es ist keine Musik geladen."
+
+        start_t = float(self.slider_start.get())
+        end_t = float(self.slider_end.get())
+        abs_cuts = self.manual_cuts_absolute()
+        inside = [c for c in abs_cuts if start_t - 0.05 <= c <= end_t + 0.05]
         if len(inside) < 2:
+            return (f"Die Cuts liegen zwischen {min(abs_cuts):.1f}s und {max(abs_cuts):.1f}s, "
+                    f"gewaehlt ist aber {start_t:.1f}s bis {end_t:.1f}s.")
+        return ""
+
+    def apply_manual_cuts_range(self):
+        """Setzt Start/Ende auf den Bereich, in dem aufgezeichnet wurde."""
+        if not self.manual_cuts_range or not self.audio_duration:
+            return
+        try:
+            a, b = float(self.manual_cuts_range[0]), float(self.manual_cuts_range[1])
+        except Exception:
+            return
+        if b <= a:
+            return
+        self.slider_start.set(a)
+        self.slider_end.set(b)
+        self.lbl_start.configure(text=f"Start: {a:.1f}s")
+        self.lbl_end.configure(text=f"Ende: {b:.1f}s")
+        self.draw_waveform()
+        self.refresh_manual_cuts_ui()
+
+    def effective_manual_cuts(self):
+        """
+        Liefert die Cuts, die ein Render tatsaechlich verwenden soll - oder None.
+
+        Der Renderer rechnet die Beat-Zeiten relativ zum Start des Renderfensters
+        (siehe generate_edit: raw_frame_indices = t * fps), deshalb werden die
+        absoluten Cuts hier auf [slider_start, slider_end] bezogen.
+        """
+        if self.manual_cuts_problem():
             return None
-        return inside
+        start_t = float(self.slider_start.get())
+        end_t = float(self.slider_end.get())
+        abs_cuts = self.manual_cuts_absolute()
+        inside = [c for c in abs_cuts if start_t - 0.05 <= c <= end_t + 0.05]
+        return [round(c - start_t, 4) for c in inside]
 
     def refresh_manual_cuts_ui(self):
         lbl = getattr(self, "lbl_manual_cuts", None)
@@ -4357,11 +4446,13 @@ class EditMakerApp(ctk.CTk):
         n = len(self.manual_cuts)
         if n < 2:
             lbl.configure(
-                text="Keine Cuts gespeichert - 'Manuell aufnehmen' oder im Review 'Ccuts uebernehmen'.",
+                text="Keine Cuts gespeichert - 'Jetzt aufnehmen' oder im Review 'Ccuts uebernehmen'.",
                 text_color="#64748b"
             )
             if hasattr(self, "btn_manual_cuts_clear"):
                 self.btn_manual_cuts_clear.configure(state="disabled")
+            if hasattr(self, "btn_manual_cuts_range"):
+                self.btn_manual_cuts_range.configure(state="disabled")
             if hasattr(self, "chk_manual_cuts"):
                 self.chk_manual_cuts.deselect()
             return
@@ -4371,16 +4462,27 @@ class EditMakerApp(ctk.CTk):
                        and os.path.normcase(os.path.abspath(self.manual_cuts_audio))
                        == os.path.normcase(os.path.abspath(self.audio_path)))
         rng = self.manual_cuts_range or (0.0, 0.0)
-        warn = "" if matches else " - ACHTUNG: andere Musik geladen, Cuts werden nicht verwendet"
+
+        # Checkbox nie eigenmaechtig umschalten - sonst sieht es aktiv aus,
+        # obwohl die Cuts aus einem anderen Grund nicht greifen.
+        if matches and hasattr(self, "chk_manual_cuts"):
+            self.chk_manual_cuts.select()
+        self.use_manual_cuts_var.set(matches and self.use_manual_cuts_var.get())
+
+        problem = self.manual_cuts_problem()
+        info = f"{n - 2} Cuts gespeichert  |  {base}  |  {rng[0]:.1f}s - {rng[1]:.1f}s"
+        if problem:
+            info += f"\nNicht verwendet: {problem}"
         lbl.configure(
-            text=f"{n - 2} Cuts gespeichert  |  {base}  |  {rng[0]:.1f}s - {rng[1]:.1f}s{warn}",
-            text_color="#38bdf8" if matches else "#f59e0b"
+            text=info,
+            text_color="#22c55e" if not problem else "#f59e0b"
         )
         if hasattr(self, "btn_manual_cuts_clear"):
             self.btn_manual_cuts_clear.configure(state="normal")
-        if matches and hasattr(self, "chk_manual_cuts"):
-            self.chk_manual_cuts.select()
-        self.use_manual_cuts_var.set(matches)
+        if hasattr(self, "btn_manual_cuts_range"):
+            self.btn_manual_cuts_range.configure(
+                state="normal" if matches and self.audio_duration else "disabled"
+            )
 
     def open_manual_recorder(self, start_t, end_t, out_path):
         self.manual_review_source = self.audio_path

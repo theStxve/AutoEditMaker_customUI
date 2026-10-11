@@ -13,9 +13,16 @@ Ein professionelles Beat-Sync Video-Editing Tool mit moderner CustomTkinter-Ober
     **Schnell-Vorschau** und **Batch-Export** verwenden dieselben Cuts.
   - **Projekt speichern** legt die Cuts in der `.aep` mit ab (Format-Version 3),
     sodass ein gespeichertes Projekt die Edit-Positionen behaelt.
-  - Sicherheitsregeln: Cuts gelten nur fuer die Musik, zu der sie aufgenommen
-    wurden, nur im gewaehlten Start/Ende-Bereich und nur wenn die Checkbox
-    "Verwenden" gesetzt ist. Sonst wuerde still ein fremder Schnitt benutzt.
+  - Die Cuts werden **relativ zum Aufnahmefenster** gespeichert und beim Rendern
+    korrekt auf den Start des Renderfensters bezogen - auch wenn die Passage
+    nicht bei 0:00 beginnt (z. B. aufgenommen zwischen 48,5 s und 65,4 s).
+  - **"Bereich laden"** setzt Start und Ende wieder auf den aufgezeichneten
+    Bereich zurueck, falls du ihn zwischenzeitlich verschoben hast.
+  - Die Statuszeile sagt immer, warum Cuts gerade nicht greifen, statt
+    pauschal zum erneuten Aufnehmen aufzufordern:
+    falsche Musik, Checkbox aus, falscher Bereich - jeweils mit konkreter Zahl.
+  - Beim Rendern mit unbrauchbaren Cuts startet **keine neue Aufnahme**, sondern
+    die App nennt das Problem und bietet "Bereich laden" an.
 - **Keine Hochskalierung mehr als Standard**:
   - Aufloesung **"Auto (Quell-Aufloesung)"** ist jetzt Default. Aus 720p-Quellen
     werden keine 1080p-Bilder mehr erfunden.
