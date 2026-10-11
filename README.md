@@ -59,6 +59,7 @@ Ein professionelles Beat-Sync Video-Editing Tool mit moderner CustomTkinter-Ober
 - **Aufnahme-Review nach dem manuellen Schneiden**:
   - Nach dem Aufnehmen geht es nicht mehr direkt ins Rendern, sondern in eine Pruefansicht.
   - Wellenform des Auswahlbereichs mit einem Marker pro Cut (gruen = am Beat eingerastet, orange duenn = roher Tap) und Positionsanzeige waehrend der Wiedergabe.
+  - **Cuts direkt in der Wellenform verschieben**: Marker greifen und ziehen, rastet automatisch auf den naechsten echten Onset ein (90ms Radius). Laeuft ein Klickton mit, man hoert also beim Verschieben direkt, wo der Cut landet. Grenzen zu den Nachbar-Cuts werden eingehalten, damit nichts kollidiert.
   - **Audio-Indikatoren**: ein Klickton markiert jeden Cut hoerbar, damit man ohne Rendern hoert, ob der Schnitt sitzt. Abschaltbar.
   - Zusammenfassung "N Schnitte | X eingerastet | Y frei | Z%" plus Navigation (Von vorn / Zum ersten Cut).
   - "Zufrieden - rendern" startet den Export, "Neu aufnehmen" verwirft und macht den Recorder erneut auf.
@@ -82,7 +83,8 @@ Ein professionelles Beat-Sync Video-Editing Tool mit moderner CustomTkinter-Ober
   - **Linksklick** setzt den Startpunkt, **Rechtsklick** setzt den Endpunkt.
   - Beim Vorhoeren laeuft ein gelber Playhead durch die Waveform, die aktuelle Position steht rechts daneben.
 - **KI-Auto-Reframe**: haelt das Subject im 9:16-Crop (YuNet-Gesichtserkennung, sonst Hautton-/Bewegungs-Tracking, zeitlich geglaettet).
-- **Schnell-Vorschau (Proxy)**: 480p/24fps-Proxy-Render in ~2.5x kuerzerer Zeit, um Settings vor dem Final-Render zu testen.
+- **Schnell-Vorschau (Proxy)**: 480p/30fps-Proxy-Render (~3x schneller) um Settings vor dem Final-Render zu testen.
+  Die Vorschau aendert ausschliesslich Aufloesung, Framerate und CRF - Effekte, Crop, Collage und Timing sind identisch zum Export. Eine Vorschau, die anders aussieht als das Ergebnis, taugt nichts als Entscheidungsgrundlage.
 - **Batch-Export**: rendert N Varianten mit gemischter Clip-Reihenfolge in einem Durchlauf.
 - **Projekt-Speichern**: kompletter Arbeitsstand (Clips, Song, Trim, Effekte, Overlay) als `.aep`, mit relativen Pfaden.
 - **Undo/Redo**: bis zu 60 Schritte ueber alle Einstellungen, Medien und Trim-Punkte.

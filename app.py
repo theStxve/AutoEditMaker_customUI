@@ -616,7 +616,7 @@ EFFECT_SETS = {
         "freeze_on_drop": True,
         "grain": 0.010,
         "vignette": True,
-        "collage_prob": 0.018,
+        "collage_prob": 0.05,
         "spin_prob": 0.010,
     },
     "Cinematic (Zurückhaltend)": {
@@ -628,7 +628,7 @@ EFFECT_SETS = {
         "freeze_on_drop": False,
         "grain": 0.014,
         "vignette": True,
-        "collage_prob": 0.0,
+        "collage_prob": 0.02,
         "spin_prob": 0.0,
     },
     "Beat Edit (Dynamisch)": {
@@ -640,7 +640,7 @@ EFFECT_SETS = {
         "freeze_on_drop": True,
         "grain": 0.008,
         "vignette": True,
-        "collage_prob": 0.030,
+        "collage_prob": 0.09,
         "spin_prob": 0.018,
     },
     "Maximal (Volle Power)": {
@@ -652,7 +652,7 @@ EFFECT_SETS = {
         "freeze_on_drop": True,
         "grain": 0.006,
         "vignette": True,
-        "collage_prob": 0.045,
+        "collage_prob": 0.14,
         "spin_prob": 0.028,
     },
     "Keine Effekte (Clean Cut)": {
@@ -3462,16 +3462,19 @@ class EditMakerApp(ctk.CTk):
     # Aufnahme-Review: Player mit Waveform + Hit-Indikatoren
     # =====================================================================
     def open_manual_review(self, start_t, end_t, out_path, final_beats,
-                           raw_taps, snapped, loose, master_audio_wav, latency_ms=70.0):
+                           raw_taps, snapped, loose, master_audio_wav,
+                           latency_ms=70.0, onsets=None):
         """
         Zeigt die Aufnahme zur Kontrolle: Waveform mit einem Marker pro Cut,
         Playback mit Klick-Indikator an jedem Hit und die Frage, ob's passt.
         """
         duration = max(0.5, end_t - start_t)
+        beats_list = final_beats          # in-place editierbar
+        onset_list = list(onsets) if onsets is not None else []
+
         win = ctk.CTkToplevel(self)
         win.title("Aufnahme pruefen")
-        win.geometry("880x560")
-        win.minsize(760, 480)
+        win.minsize(820, 520)
         win.transient(self)
 
         ctk.CTkLabel(
@@ -3509,7 +3512,8 @@ class EditMakerApp(ctk.CTk):
         state = {
             "env": None, "hop": 0.02, "playing": False, "t0": 0.0,
             "pos": 0.0, "next": 0, "indicators": True, "job": None,
-            "cursor": None,
+            "cursor": None, "drag_idx": None, "drag_time": None,
+            "last_click": -1.0,
         }
 
         def wave_width():
@@ -3518,40 +3522,129 @@ class EditMakerApp(ctk.CTk):
                 w = wave.winfo_reqwidth()
             return max(300, w)
 
+        def movable_range():
+            return range(1, max(2, len(beats_list) - 1))
+
+        def draw_cuts():
+            """Nur die Cut-Marker neu zeichnen (fuer Draggen ohne Full-Redraw)."""
+            wave.delete("cuts")
+            w = wave_width()
+            h = wave.winfo_height()
+            for idx in movable_range():
+                b = beats_list[idx]
+                x = int(b / duration * w)
+                if not (0 <= x < w):
+                    continue
+                active = (state["drag_idx"] == idx)
+                wave.create_line(x, 0, x, h, fill="#facc15" if active else "#22c55e",
+                                width=3 if active else 2, tags="cuts")
+                wave.create_oval(x - 5, 2, x + 5, 12, fill="#facc15" if active else "#22c55e",
+                                outline="", tags="cuts")
+                wave.create_text(x + 8, 9, text=f"{b:.2f}s",
+                                 fill="#facc15" if active else "#22c55e",
+                                 font=("Consolas", 8, "bold"),
+                                 anchor="w", tags="cuts")
+
         def draw_static():
             wave.delete("base")
             w, h = wave_width(), wave.winfo_height()
             mid = h / 2.0
             env = state["env"]
-            if env is None or len(env) == 0:
-                return
-            max_v = float(np.percentile(env, 98)) or 1.0
-            top, bot = [], []
-            for x in range(0, w, 1):
-                i0 = int(x / float(w) * duration / state["hop"])
-                i1 = int((x + 1) / float(w) * duration / state["hop"])
-                i0 = max(0, min(len(env) - 1, i0))
-                i1 = max(i0 + 1, min(len(env), i1))
-                seg = env[i0:i1]
-                v = (float(np.max(seg)) / max_v) if len(seg) else 0.0
-                amp = min(1.0, v) * (mid - 4)
-                top.extend((x, mid - amp))
-                bot.extend((x, mid + amp))
-            if top:
-                wave.create_polygon(top + list(reversed(bot)), fill="#1e3a5f", outline="", tags="base")
-
-            # Roh-Taps (orange, duenn) und finale Cuts (gruen, dick)
+            if env is not None and len(env) > 0:
+                max_v = float(np.percentile(env, 98)) or 1.0
+                top, bot = [], []
+                for x in range(0, w, 1):
+                    i0 = int(x / float(w) * duration / state["hop"])
+                    i1 = int((x + 1) / float(w) * duration / state["hop"])
+                    i0 = max(0, min(len(env) - 1, i0))
+                    i1 = max(i0 + 1, min(len(env), i1))
+                    seg = env[i0:i1]
+                    v = (float(np.max(seg)) / max_v) if len(seg) else 0.0
+                    amp = min(1.0, v) * (mid - 14)
+                    top.extend((x, mid - amp))
+                    bot.extend((x, mid + amp))
+                if top:
+                    wave.create_polygon(top + list(reversed(bot)), fill="#1e3a5f",
+                                        outline="", tags="base")
             for tap in raw_taps:
                 x = int(tap / duration * w)
                 if 0 <= x < w:
-                    wave.create_line(x, mid - 14, x, mid + 14, fill="#f59e0b", tags="base")
-            for b in final_beats:
-                if b <= 0.001 or b >= duration - 0.001:
+                    wave.create_line(x, mid - 12, x, mid + 12, fill="#f59e0b", tags="base")
+            draw_cuts()
+
+        # --- Cuts verschieben ------------------------------------------
+        def time_from_x(x):
+            return max(0.0, min(duration, x / float(wave_width()) * duration))
+
+        def x_from_time(t):
+            return int(t / duration * wave_width())
+
+        def snap_to_onset(t, lo, hi):
+            """Auf den naechsten echten Onset einrasten, aber nur wenn er
+            nicht mit einem Nachbar-Cut kollidiert."""
+            if not onset_list:
+                return max(lo, min(hi, t))
+            best, best_d = None, 0.09
+            for o in onset_list:
+                if o < lo or o > hi:
                     continue
-                x = int(b / duration * w)
-                if 0 <= x < w:
-                    wave.create_line(x, 0, x, h, fill="#22c55e", width=2, tags="base")
-                    wave.create_oval(x - 4, 4, x + 4, 12, fill="#22c55e", outline="", tags="base")
+                d = abs(o - t)
+                if d < best_d:
+                    best, best_d = o, d
+            return best if best is not None else max(lo, min(hi, t))
+
+        def on_press(event):
+            if state["drag_idx"] is not None:
+                return
+            x = event.x
+            w = wave_width()
+            tol = max(8, int(w * 0.012))
+            best_idx, best_d = None, tol
+            for idx in movable_range():
+                d = abs(x_from_time(beats_list[idx]) - x)
+                if d < best_d:
+                    best_idx, best_d = idx, d
+            if best_idx is not None:
+                state["drag_idx"] = best_idx
+                wave.configure(cursor="sb_h_double_arrow")
+                draw_cuts()
+
+        def on_motion(event):
+            idx = state["drag_idx"]
+            if idx is None:
+                return
+            raw_t = time_from_x(event.x)
+            lo = beats_list[idx - 1] + 0.15
+            hi = beats_list[idx + 1] - 0.15
+            if hi < lo:
+                return
+            lo_s = beats_list[idx - 1] + 0.02
+            hi_s = beats_list[idx + 1] - 0.02
+            t = snap_to_onset(raw_t, lo_s, hi_s)
+            t = max(lo, min(hi, t))
+            beats_list[idx] = t
+            state["drag_time"] = t
+            draw_cuts()
+            lbl_status.configure(text=f"Cut #{idx} -> {t:.2f}s")
+            if click_sound is not None and abs(t - state["last_click"]) > 0.12:
+                state["last_click"] = t
+                click_sound.play()
+
+        def on_release(event):
+            if state["drag_idx"] is None:
+                return
+            state["drag_idx"] = None
+            wave.configure(cursor="hand2")
+            draw_cuts()
+            set_pos(state["pos"])
+            lbl_drag.configure(
+                text=f"Cut verschoben auf {state['drag_time']:.2f}s" if state["drag_time"] else ""
+            )
+
+        wave.bind("<ButtonPress-1>", on_press)
+        wave.bind("<B1-Motion>", on_motion)
+        wave.bind("<ButtonRelease-1>", on_release)
+        wave.configure(cursor="hand2")
 
         def draw_cursor():
             if state["cursor"] is not None:
@@ -3596,8 +3689,8 @@ class EditMakerApp(ctk.CTk):
 
             # Audio-Indikator an jedem Cut, vor dem Ohr des Nutzers
             if state["indicators"] and click_sound is not None:
-                while state["next"] < len(final_beats):
-                    mark = final_beats[state["next"]]
+                while state["next"] < len(beats_list):
+                    mark = beats_list[state["next"]]
                     if mark > elapsed:
                         break
                     if mark >= 0.05 and mark <= duration - 0.05:
@@ -3641,31 +3734,40 @@ class EditMakerApp(ctk.CTk):
         ).pack(side="left", padx=6, pady=(10, 0))
 
         ctk.CTkButton(
-            win, text="Zum ersten Cut", command=lambda: set_pos(final_beats[1] if len(final_beats) > 1 else 0.0),
+            win, text="Zum ersten Cut", command=lambda: set_pos(beats_list[1] if len(beats_list) > 1 else 0.0),
             fg_color="#334155", hover_color="#475569", width=150, height=38
         ).pack(side="left", padx=6, pady=(10, 0))
 
+        lbl_drag = ctk.CTkLabel(
+            win, text="Marker mit der Maus greifen und verschieben",
+            font=("Arial", 10), text_color="#64748b"
+        )
+        lbl_drag.pack(side="left", padx=14, pady=(10, 0))
+
         # --- Entscheidung ---------------------------------------------
+        # Grid statt Pack: sonst wandern die rechts gepackten Buttons bei
+        # schmalen Fenstern auf negative x-Koordinaten und sind unerreichbar.
         decision = ctk.CTkFrame(win, fg_color="transparent")
-        decision.pack(fill="x", padx=16, pady=(12, 8))
+        decision.pack(fill="x", padx=16, pady=(10, 10))
+        decision.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
             decision,
-            text="Nicht zufrieden? Neu aufnehmen verwirft die bisherigen Cuts.",
-            font=("Arial", 10), text_color="#94a3b8", wraplength=300, justify="right"
-        ).pack(side="left")
+            text="Nicht zufrieden? 'Neu aufnehmen' verwirft die bisherigen Cuts.",
+            font=("Arial", 10), text_color="#94a3b8", anchor="w"
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
 
         def accept():
             stop_playback()
             win.destroy()
             self.set_status(
-                f"Generiere Video aus {len(final_beats) - 2} manuellen Schnitten "
+                f"Generiere Video aus {len(beats_list) - 2} manuellen Schnitten "
                 f"({snapped} am Beat eingerastet, {loose} frei)...", 0.1
             )
             render_settings = self.collect_render_settings()
             threading.Thread(
                 target=self.generate_edit,
-                args=(start_t, end_t, out_path, final_beats, "manual",
+                args=(start_t, end_t, out_path, list(beats_list), "manual",
                       master_audio_wav, False, None, render_settings),
                 daemon=True
             ).start()
@@ -3687,13 +3789,13 @@ class EditMakerApp(ctk.CTk):
         ctk.CTkButton(
             decision, text="Neu aufnehmen", command=redo,
             fg_color="#8b1e1e", hover_color="#631414", width=160, height=42
-        ).pack(side="right", padx=6)
+        ).grid(row=1, column=0, sticky="e", padx=6)
 
         ctk.CTkButton(
             decision, text="Zufrieden - rendern", command=accept,
             fg_color="#1f8a4c", hover_color="#176b3b", width=220, height=42,
             font=("Arial", 14, "bold")
-        ).pack(side="right", padx=6)
+        ).grid(row=1, column=1, sticky="e", padx=6)
 
         wave.bind("<Configure>", lambda e: (draw_static(), draw_cursor()))
         win.protocol("WM_DELETE_WINDOW", discard)
@@ -3714,7 +3816,9 @@ class EditMakerApp(ctk.CTk):
             self._ui_after(0, _apply)
 
         threading.Thread(target=_load_wave, daemon=True).start()
-        self._center_window(win, min_w=760, min_h=500, max_w=980)
+        # Breite nicht kappen: lieber etwas breiter als dass die Buttons
+        # rechts aus dem Fenster rauslaufen.
+        self._center_window(win, min_w=880, min_h=540, max_w=1600)
         return win
 
     # =====================================================================
@@ -3968,7 +4072,8 @@ class EditMakerApp(ctk.CTk):
                 self.open_manual_review(
                     start_t, end_t, out_path, final_beats, raw_sorted,
                     snapped, loose, master_audio_wav,
-                    latency_ms=float(latency_var.get())
+                    latency_ms=float(latency_var.get()),
+                    onsets=detected_onsets
                 )
             else:
                 shutil.rmtree(temp_dir, ignore_errors=True)
@@ -4073,18 +4178,18 @@ class EditMakerApp(ctk.CTk):
             # KI-Auto-Reframe
             enable_auto_reframe = cfg["ai_reframe"] and orientation == "portrait"
 
-            # Proxy-Modus (Schnell-Vorschau): kleines Format, wenig FPS, keine teuren Effekte
+            # Proxy-Modus (Schnell-Vorschau): NUR Aufloesung/FPS/CRF aendern.
+            # Effekte muessen identisch bleiben - sonst sieht die Vorschau
+            # anders aus als der Export und taugt nichts als Entscheidungs-
+            # grundlage. Wer es dennoch schneller braucht, dreht die
+            # Effekt-Intensitaet runter statt die Vorschau zu faetschen.
             if proxy:
-                fps = 24
+                # 30 statt 24 FPS: bei 24 verschwinden kurze Effekte (Flash,
+                # Punch) im Rauschen und die Vorschau verkauft den Export falsch.
+                fps = min(30, int(cfg["fps"]) if cfg["fps"] else 30)
                 crf_val = "30"
                 preset_val = "ultrafast"
                 res_choice = "Proxy (480p)"
-                allow_shake = False
-                allow_rgb = False
-                allow_speedramp = False
-                enable_auto_reframe = False
-                apply_cinematic_lut = False
-                allow_bass_pulse = False
 
             # Spinning Overlay Variables
             overlay_img = cfg["overlay_img_path"]
@@ -4704,7 +4809,6 @@ class EditMakerApp(ctk.CTk):
                 clip_audio_vol = 0.0
 
             cpu_threads = max(4, min(16, os.cpu_count() or 4))
-            video_paths = self.video_paths
             clip_idx = 0
             i = 0
             total_dur_count = len(durations)
@@ -4715,8 +4819,35 @@ class EditMakerApp(ctk.CTk):
             # Collage & Spin (aus dem Original-Repo uebernommen)
             # Die verbrauchten Beats werden uebersprungen, damit das
             # Beat-Gitter synchron bleibt.
+            #  - 2x2 braucht mindestens 3 freie Beats, sonst fuellt das Raster
+            #    nicht und man sieht statt eines Gitters ein einzelnes Bild.
+            #  - das 4x4-Raster ist ein Highlight und landet nur kurz vor dem Drop.
             # -------------------------------------------------------------
             collage_seen = 0
+            collage16_seen = 0
+            drop_window_s = 8.0
+            drop_start_t = (active_drop_index / float(fps)) if active_drop_index is not None else None
+
+            def apply_finishing(clip):
+                """Korn/Vignette/LUT - auch fuer Collage & Spin, sonst sehen
+                die Raster-Segmente roh aus und fallen aus dem Bild."""
+                grain_field = build_grain_field(th, tw, grain_amount, render_seed + 13)
+                counter = [0]
+
+                def finisher(gf, t):
+                    frame = gf(t)
+                    if allow_vignette and vignette_mask is not None:
+                        frame = cv2.multiply(frame, vignette_mask, scale=1.0 / 255.0)
+                    if apply_cinematic_lut:
+                        frame = cv2.LUT(frame, CINEMATIC_LUT)
+                    if grain_field is not None:
+                        frame = apply_film_grain(frame, grain_field, counter[0])
+                        counter[0] += 1
+                    return frame
+
+                if grain_field is None and not apply_cinematic_lut and not (allow_vignette and vignette_mask is not None):
+                    return clip
+                return clip.fl(finisher)
 
             def build_collage_4(start_idx, steps):
                 """Hintergrund + bis zu 4 Kacheln, die Beat fuer Beat einblenden."""
@@ -4864,13 +4995,26 @@ class EditMakerApp(ctk.CTk):
 
                 # Collage / Spin - verbrauchen mehrere Beats, das Gitter bleibt synchron
                 available_after = total_dur_count - i - 1
+                # Abstand bis zum Drop in Beats -> "kurz vor dem Drop"?
+                near_drop = False
+                if drop_start_t is not None:
+                    gap = drop_start_t - cut_global_start
+                    if 0.0 < gap <= drop_window_s:
+                        near_drop = True
+
                 do_16 = (
-                    collage_prob > 0.0 and available_after >= 4
-                    and collage_seen < 3 and effect_rng.random() < (collage_prob * 0.45)
+                    near_drop
+                    and collage_prob > 0.0
+                    and available_after >= 4
+                    and collage16_seen < 1
+                    and effect_rng.random() < 0.55
                 )
                 do_collage = (
-                    not do_16 and collage_prob > 0.0 and available_after >= 1
-                    and collage_seen < 5 and effect_rng.random() < collage_prob
+                    not do_16
+                    and collage_prob > 0.0
+                    and available_after >= 3
+                    and collage_seen < 5
+                    and effect_rng.random() < collage_prob
                 )
                 do_spin = (
                     not do_16 and not do_collage and spin_prob > 0.0
@@ -4894,6 +5038,7 @@ class EditMakerApp(ctk.CTk):
                         if has_overlay and (cut_global_start + seg_dur >= active_overlay_start):
                             seg_clip = apply_spinning_overlay(seg_clip, i, cut_global_start, seg_dur)
 
+                        seg_clip = apply_finishing(seg_clip)
                         write_segment(seg_clip, False)
                         source_clip.close()
                         for e in extra_sources:
@@ -4903,6 +5048,8 @@ class EditMakerApp(ctk.CTk):
                                 pass
 
                         collage_seen += 1
+                        if label == "16-Collage":
+                            collage16_seen += 1
                         clip_idx = (clip_idx + 1 + max(0, consumed)) % len(video_paths)
                         i += 1 + max(0, consumed)
 
