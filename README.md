@@ -4,6 +4,16 @@ Ein professionelles Beat-Sync Video-Editing Tool mit moderner CustomTkinter-Ober
 
 ## Highlights & Features
 
+- **Millisekundengenaue Waveform-Bearbeitung**:
+  - **Zoom mit dem Mausrad** in der Haupt-Wellenform und im Aufnahme-Review.
+  - **Verschieben mit der mittleren Maustaste**, **Doppelklick = Ansicht zuruecksetzen**.
+  - **Tastatur-Nudging**: Pfeiltasten verschieben den gewaehlten Cut um **1 ms**,
+    mit **Shift um 10 ms** - damit lassen sich Cuts exakt auf Transienten legen.
+  - **Frei platzierbare Cuts per Default**: Snapping ist aus, ein gezogener Cut
+    landet exakt dort, wo die Maus loslaesst, statt auf den Beat zurueckzuspringen.
+  - **Optionales Beat-Snapping** ueber die Checkbox "An Beats einrasten": rastet
+    dann wieder auf erkannte Onsets ein, ohne die Nachbar-Cuts zu ueberlappen.
+  - Die Zeitachse zeigt den sichtbaren Bereich inklusive Millisekunden genau an.
 - **Profile & Presets (Speichern & Laden)**:
   - Vollstaendige Presets direkt speichern, laden, importieren und exportieren.
   - Vorkonfigurierte Profile fuer TikTok/Reels, Velocity, Cinematic und Minimal.

@@ -1347,11 +1347,17 @@ class EditMakerApp(ctk.CTk):
         self.wave_canvas.bind("<Configure>", lambda e: self.draw_waveform())
         self.wave_canvas.bind("<Button-1>", self.on_waveform_click)
         self.wave_canvas.bind("<Button-3>", self.on_waveform_right_click)
+        self.wave_canvas.bind("<MouseWheel>", self.on_waveform_wheel)
+        self.wave_canvas.bind("<ButtonPress-2>", self.on_waveform_pan_start)
+        self.wave_canvas.bind("<B2-Motion>", self.on_waveform_pan)
+        self.wave_canvas.bind("<Double-Button-1>", self.on_waveform_reset_view)
         self.wave_env = None
         self.wave_hop = 0.0
         self.wave_beats = []
         self.wave_drop = 0.0
         self.wave_playhead = None
+        self.wave_view = (0.0, 1.0)   # von load_audio_into_ui auf die echte Dauer gesetzt
+        self._pan_last_x = 0
         self.drop_candidates = []
         self.drop_scan_offset = 0.0
         self._candidate_win = None
@@ -2509,6 +2515,7 @@ class EditMakerApp(ctk.CTk):
         self.slider_end.configure(to=self.audio_duration)
         self.slider_start.set(0)
         self.slider_end.set(self.audio_duration)
+        self.wave_view = (0.0, self.audio_duration)
         self.lbl_start.configure(text="Start: 0.0s")
         self.lbl_end.configure(text=f"Ende: {self.audio_duration:.1f}s")
         if hasattr(self, 'slider_overlay_sec'):
@@ -2584,6 +2591,54 @@ class EditMakerApp(ctk.CTk):
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _wave_view(self):
+        """Sichtbarer Zeitbereich der Wellenform (Zoom)."""
+        dur = self.audio_duration
+        v0, v1 = getattr(self, "wave_view", (0.0, dur))
+        if not dur:
+            return 0.0, 1.0
+        span = max(0.05, min(dur, v1 - v0))
+        v0 = max(0.0, min(dur - span, v0))
+        return v0, v0 + span
+
+    def _wave_set_view(self, v0, v1):
+        dur = self.audio_duration
+        if not dur:
+            return
+        span = max(0.05, min(dur, v1 - v0))
+        v0 = max(0.0, min(dur - span, v0))
+        self.wave_view = (v0, v0 + span)
+        self.draw_waveform()
+
+    def on_waveform_wheel(self, event):
+        if not self.audio_duration:
+            return
+        v0, v1 = self._wave_view()
+        t = self._wave_time_from_x(event.x)
+        span = v1 - v0
+        factor = 0.8 if event.delta > 0 else 1.25
+        new_span = max(0.08, min(self.audio_duration, span * factor))
+        ratio = (t - v0) / span if span > 0 else 0.5
+        new_v0 = t - ratio * new_span
+        self._wave_set_view(new_v0, new_v0 + new_span)
+
+    def on_waveform_pan(self, event):
+        if not self.audio_duration:
+            return
+        v0, v1 = self._wave_view()
+        span = v1 - v0
+        w = self._wave_width()
+        delta_t = -(event.x - self._pan_last_x) / float(w) * span if w else 0
+        self._pan_last_x = event.x
+        self._wave_set_view(v0 + delta_t, v0 + delta_t + span)
+
+    def on_waveform_pan_start(self, event):
+        self._pan_last_x = event.x
+
+    def on_waveform_reset_view(self, event=None):
+        self.wave_view = (0.0, self.audio_duration)
+        self.draw_waveform()
+
     def _wave_width(self):
         """Canvas-Breite; winfo_width() ist vor dem Layout 1, dann waere die
         Wellenform unsichtbar. Auf die angeforderte Breite zurueckfallen."""
@@ -2619,18 +2674,26 @@ class EditMakerApp(ctk.CTk):
         max_v = float(np.percentile(env, 98)) or 1.0
         start_offset = self.drop_scan_offset or 0.0
 
+        v0, v1 = self._wave_view()
+        span = max(1e-6, v1 - v0)
+
+        def x_of(t):
+            return int((t - v0) / span * w)
+
         for b in self.wave_beats:
-            x = int(b / dur * w)
+            x = x_of(b)
             if 0 <= x < w:
                 canvas.create_line(x, 0, x, h, fill="#16243b")
 
         top_pts = []
         bot_pts = []
+        i_start = max(0, int(v0 / hop))
+        i_end = min(len(env), int(v1 / hop) + 2)
         for x in range(0, w, 1):
-            i0 = int(x / float(w) * dur / hop)
-            i1 = int((x + 1) / float(w) * dur / hop)
-            i0 = max(0, min(len(env) - 1, i0))
-            i1 = max(i0 + 1, min(len(env), i1))
+            t_a = v0 + (x / float(w)) * span
+            t_b = v0 + ((x + 1) / float(w)) * span
+            i0 = max(0, min(len(env) - 1, int(t_a / hop)))
+            i1 = max(i0 + 1, min(len(env), int(t_b / hop) + 1))
             seg = env[i0:i1]
             v = float(np.max(seg)) / max_v if len(seg) else 0.0
             amp = min(1.0, v) * (mid - 2)
@@ -2641,8 +2704,8 @@ class EditMakerApp(ctk.CTk):
             polygon = top_pts + list(reversed(bot_pts))
             canvas.create_polygon(polygon, fill="#38bdf8", outline="")
 
-        xs = int(self.slider_start.get() / dur * w)
-        xe = int(self.slider_end.get() / dur * w)
+        xs = x_of(self.slider_start.get())
+        xe = x_of(self.slider_end.get())
         if xs > 0:
             canvas.create_rectangle(0, 0, xs, h, fill="#020617", stipple="gray50", outline="")
         if xe < w:
@@ -2651,8 +2714,14 @@ class EditMakerApp(ctk.CTk):
         canvas.create_line(xs, 0, xs, h, fill="#22c55e", width=2)
         canvas.create_line(xe, 0, xe, h, fill="#f97316", width=2)
 
+        # Zoom-Anzeige
+        canvas.create_text(
+            6, h - 9, text=f"{v0:.2f}s - {v1:.2f}s",
+            fill="#475569", font=("Consolas", 9), anchor="w"
+        )
+
         if self.wave_drop > 0:
-            xd = int(self.wave_drop / dur * w)
+            xd = x_of(self.wave_drop)
             if 0 <= xd < w:
                 canvas.create_line(xd, 0, xd, h, fill="#ef4444", width=2)
                 label_x = xd + 4 if xd < w - 46 else xd - 4
@@ -2663,7 +2732,7 @@ class EditMakerApp(ctk.CTk):
 
         for cand in self.drop_candidates:
             t = start_offset + cand["time"]
-            x = int(t / dur * w)
+            x = x_of(t)
             if not (0 <= x < w):
                 continue
             if cand.get("is_best"):
@@ -2697,7 +2766,10 @@ class EditMakerApp(ctk.CTk):
             h = canvas.winfo_reqheight() or 70
         if w <= 2 or h <= 2:
             return
-        x = int(t_abs / self.audio_duration * w)
+        v0, v1 = self._wave_view()
+        x = int((t_abs - v0) / max(1e-6, v1 - v0) * w)
+        if not (0 <= x < w):
+            return
         canvas.create_line(x, 0, x, h, fill="#facc15", width=2, tags="playhead")
         canvas.create_oval(
             x - 4, 0, x + 4, 8, fill="#facc15", outline="", tags="playhead"
@@ -2712,8 +2784,9 @@ class EditMakerApp(ctk.CTk):
     def _wave_time_from_x(self, event):
         if not self.audio_duration:
             return None
+        v0, v1 = self._wave_view()
         frac = max(0.0, min(1.0, event.x / float(self._wave_width())))
-        return frac * self.audio_duration
+        return max(0.0, min(self.audio_duration, v0 + frac * (v1 - v0)))
 
     def on_waveform_click(self, event):
         t = self._wave_time_from_x(event)
@@ -3514,6 +3587,7 @@ class EditMakerApp(ctk.CTk):
             "pos": 0.0, "next": 0, "indicators": True, "job": None,
             "cursor": None, "drag_idx": None, "drag_time": None,
             "last_click": -1.0,
+            "view": (0.0, duration), "sel": None, "pan_x": 0,
         }
 
         def wave_width():
@@ -3521,6 +3595,9 @@ class EditMakerApp(ctk.CTk):
             if w <= 2:
                 w = wave.winfo_reqwidth()
             return max(300, w)
+
+        def view_span():
+            return max(0.05, state["view"][1] - state["view"][0])
 
         def movable_range():
             return range(1, max(2, len(beats_list) - 1))
@@ -3530,32 +3607,33 @@ class EditMakerApp(ctk.CTk):
             wave.delete("cuts")
             w = wave_width()
             h = wave.winfo_height()
+            v0 = state["view"][0]
+            span = view_span()
             for idx in movable_range():
                 b = beats_list[idx]
-                x = int(b / duration * w)
+                x = int((b - v0) / span * w)
                 if not (0 <= x < w):
                     continue
-                active = (state["drag_idx"] == idx)
-                wave.create_line(x, 0, x, h, fill="#facc15" if active else "#22c55e",
-                                width=3 if active else 2, tags="cuts")
-                wave.create_oval(x - 5, 2, x + 5, 12, fill="#facc15" if active else "#22c55e",
-                                outline="", tags="cuts")
-                wave.create_text(x + 8, 9, text=f"{b:.2f}s",
-                                 fill="#facc15" if active else "#22c55e",
-                                 font=("Consolas", 8, "bold"),
-                                 anchor="w", tags="cuts")
+                active = (state["drag_idx"] == idx) or (state["sel"] == idx)
+                col = "#facc15" if active else "#22c55e"
+                wave.create_line(x, 0, x, h, fill=col, width=3 if active else 2, tags="cuts")
+                wave.create_oval(x - 5, 2, x + 5, 12, fill=col, outline="", tags="cuts")
+                wave.create_text(x + 8, 9, text=f"{b:.3f}s", fill=col,
+                                 font=("Consolas", 8, "bold"), anchor="w", tags="cuts")
 
         def draw_static():
             wave.delete("base")
             w, h = wave_width(), wave.winfo_height()
             mid = h / 2.0
+            v0, v1 = state["view"]
+            span = max(1e-6, v1 - v0)
             env = state["env"]
             if env is not None and len(env) > 0:
                 max_v = float(np.percentile(env, 98)) or 1.0
                 top, bot = [], []
                 for x in range(0, w, 1):
-                    i0 = int(x / float(w) * duration / state["hop"])
-                    i1 = int((x + 1) / float(w) * duration / state["hop"])
+                    i0 = int((v0 + (x / float(w)) * span) / state["hop"])
+                    i1 = int((v0 + ((x + 1) / float(w)) * span) / state["hop"]) + 1
                     i0 = max(0, min(len(env) - 1, i0))
                     i1 = max(i0 + 1, min(len(env), i1))
                     seg = env[i0:i1]
@@ -3567,21 +3645,86 @@ class EditMakerApp(ctk.CTk):
                     wave.create_polygon(top + list(reversed(bot)), fill="#1e3a5f",
                                         outline="", tags="base")
             for tap in raw_taps:
-                x = int(tap / duration * w)
+                x = int((tap - v0) / span * w)
                 if 0 <= x < w:
                     wave.create_line(x, mid - 12, x, mid + 12, fill="#f59e0b", tags="base")
+            wave.create_text(
+                6, h - 9, text=f"{v0:.2f}s - {v1:.2f}s",
+                fill="#475569", font=("Consolas", 9), anchor="w", tags="base"
+            )
             draw_cuts()
+
+        # --- Zoom & Auswahl -------------------------------------------
+        def set_view(v0, v1):
+            span = max(0.08, min(duration, v1 - v0))
+            v0 = max(0.0, min(duration - span, v0))
+            state["view"] = (v0, v0 + span)
+            draw_static()
+            draw_cursor()
+
+        def on_wheel(event):
+            v0, v1 = state["view"]
+            span = v1 - v0
+            t = time_from_x(event.x)
+            factor = 0.8 if event.delta > 0 else 1.25
+            new_span = max(0.08, min(duration, span * factor))
+            ratio = (t - v0) / span if span > 0 else 0.5
+            set_view(t - ratio * new_span, t - ratio * new_span + new_span)
+
+        def on_pan_start(event):
+            state["pan_x"] = event.x
+
+        def on_pan(event):
+            v0, v1 = state["view"]
+            span = v1 - v0
+            w = wave_width()
+            d = -(event.x - state["pan_x"]) / float(w) * span
+            state["pan_x"] = event.x
+            set_view(v0 + d, v0 + d + span)
+
+        def reset_view():
+            set_view(0.0, duration)
+
+        def on_key(event):
+            idx = state["sel"]
+            if idx is None:
+                return
+            step = 0.010 if (event.state & 0x0001) else 0.001   # Shift = 10ms
+            delta = 0.0
+            keysym = event.keysym
+            if keysym == "Left":
+                delta = -step
+            elif keysym == "Right":
+                delta = step
+            else:
+                return
+            lo = beats_list[idx - 1] + 0.15
+            hi = beats_list[idx + 1] - 0.15
+            if hi < lo:
+                return
+            t = max(lo, min(hi, beats_list[idx] + delta))
+            beats_list[idx] = t
+            state["drag_time"] = t
+            draw_cuts()
+            lbl_status.configure(text=f"Cut #{idx} -> {t:.3f}s")
+            if click_sound is not None and abs(t - state["last_click"]) > 0.12:
+                state["last_click"] = t
+                click_sound.play()
+            return "break"
 
         # --- Cuts verschieben ------------------------------------------
         def time_from_x(x):
-            return max(0.0, min(duration, x / float(wave_width()) * duration))
+            v0, v1 = state["view"]
+            return max(0.0, min(duration, v0 + (x / float(wave_width())) * (v1 - v0)))
 
         def x_from_time(t):
-            return int(t / duration * wave_width())
+            v0, v1 = state["view"]
+            return int((t - v0) / max(1e-6, v1 - v0) * wave_width())
 
         def snap_to_onset(t, lo, hi):
-            """Auf den naechsten echten Onset einrasten, aber nur wenn er
-            nicht mit einem Nachbar-Cut kollidiert."""
+            """Auf den naechsten echten Onset einrasten - nur wenn gewuenscht."""
+            if not snap_var.get():
+                return max(lo, min(hi, t))
             if not onset_list:
                 return max(lo, min(hi, t))
             best, best_d = None, 0.09
@@ -3597,13 +3740,13 @@ class EditMakerApp(ctk.CTk):
             if state["drag_idx"] is not None:
                 return
             x = event.x
-            w = wave_width()
-            tol = max(8, int(w * 0.012))
+            tol = max(9, int(wave_width() * 0.012))
             best_idx, best_d = None, tol
             for idx in movable_range():
                 d = abs(x_from_time(beats_list[idx]) - x)
                 if d < best_d:
                     best_idx, best_d = idx, d
+            state["sel"] = best_idx
             if best_idx is not None:
                 state["drag_idx"] = best_idx
                 wave.configure(cursor="sb_h_double_arrow")
@@ -3625,7 +3768,7 @@ class EditMakerApp(ctk.CTk):
             beats_list[idx] = t
             state["drag_time"] = t
             draw_cuts()
-            lbl_status.configure(text=f"Cut #{idx} -> {t:.2f}s")
+            lbl_status.configure(text=f"Cut #{idx} -> {t:.3f}s")
             if click_sound is not None and abs(t - state["last_click"]) > 0.12:
                 state["last_click"] = t
                 click_sound.play()
@@ -3637,13 +3780,24 @@ class EditMakerApp(ctk.CTk):
             wave.configure(cursor="hand2")
             draw_cuts()
             set_pos(state["pos"])
-            lbl_drag.configure(
-                text=f"Cut verschoben auf {state['drag_time']:.2f}s" if state["drag_time"] else ""
-            )
+            if state["sel"] is not None:
+                lbl_drag.configure(
+                    text=f"Cut #{state['sel']}: {beats_list[state['sel']]:.3f}s "
+                         f"(Pfeiltasten = 1ms, Shift = 10ms)"
+                )
 
+        snap_var = ctk.BooleanVar(value=False)
+        wave.bind("<MouseWheel>", on_wheel)
+        wave.bind("<ButtonPress-2>", on_pan_start)
+        wave.bind("<B2-Motion>", on_pan)
+        wave.bind("<Double-Button-1>", lambda e: reset_view())
         wave.bind("<ButtonPress-1>", on_press)
         wave.bind("<B1-Motion>", on_motion)
         wave.bind("<ButtonRelease-1>", on_release)
+        wave.bind("<Left>", on_key)
+        wave.bind("<Right>", on_key)
+        wave.bind("<Shift-Left>", on_key)
+        wave.bind("<Shift-Right>", on_key)
         wave.configure(cursor="hand2")
 
         def draw_cursor():
@@ -3715,34 +3869,53 @@ class EditMakerApp(ctk.CTk):
             state["job"] = win.after(20, tick)
 
         # --- Transport ------------------------------------------------
+        # Grid statt einer breiten Pack-Zeile: sonst wachsen die Controls
+        # ueber die Fensterbreite hinaus und die Entscheidungs-Buttons
+        # rutschen aus dem sichtbaren Bereich.
+        transport = ctk.CTkFrame(win, fg_color="transparent")
+        transport.pack(fill="x", padx=16, pady=(10, 0))
+        transport.grid_columnconfigure(3, weight=1)
+
         btn_play = ctk.CTkButton(
-            win, text="Abspielen", command=lambda: (stop_playback() if state["playing"] else start_playback()),
-            fg_color="#1f8a4c", hover_color="#176b3b", width=140, height=38,
+            transport, text="Abspielen", width=140, height=38,
+            command=lambda: (stop_playback() if state["playing"] else start_playback()),
+            fg_color="#1f8a4c", hover_color="#176b3b",
             font=("Arial", 13, "bold")
         )
-        btn_play.pack(side="left", padx=(16, 0), pady=(10, 0))
+        btn_play.grid(row=0, column=0, padx=(0, 10))
 
         ind_var = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(
-            win, text="Audio-Indikatoren (Klick je Cut)", variable=ind_var,
+            transport, text="Audio-Indikatoren", variable=ind_var,
             command=lambda: state.update(indicators=ind_var.get())
-        ).pack(side="left", padx=14, pady=(10, 0))
+        ).grid(row=0, column=1, padx=(0, 14), sticky="w")
+
+        ctk.CTkCheckBox(
+            transport, text="An Beats einrasten", variable=snap_var,
+            command=lambda: draw_cuts()
+        ).grid(row=0, column=2, padx=(0, 14), sticky="w")
 
         ctk.CTkButton(
-            win, text="Von vorn", command=lambda: set_pos(0.0),
-            fg_color="#334155", hover_color="#475569", width=120, height=38
-        ).pack(side="left", padx=6, pady=(10, 0))
+            transport, text="Zoom zurücksetzen", command=reset_view,
+            fg_color="#334155", hover_color="#475569", width=140, height=38
+        ).grid(row=0, column=3, padx=(0, 10), sticky="e")
 
         ctk.CTkButton(
-            win, text="Zum ersten Cut", command=lambda: set_pos(beats_list[1] if len(beats_list) > 1 else 0.0),
-            fg_color="#334155", hover_color="#475569", width=150, height=38
-        ).pack(side="left", padx=6, pady=(10, 0))
+            transport, text="Von vorn", command=lambda: set_pos(0.0),
+            fg_color="#334155", hover_color="#475569", width=120, height=34
+        ).grid(row=1, column=0, padx=(0, 10), pady=(6, 0), sticky="w")
+
+        ctk.CTkButton(
+            transport, text="Zum ersten Cut", command=lambda: set_pos(beats_list[1] if len(beats_list) > 1 else 0.0),
+            fg_color="#334155", hover_color="#475569", width=140, height=34
+        ).grid(row=1, column=1, pady=(6, 0), sticky="w")
 
         lbl_drag = ctk.CTkLabel(
-            win, text="Marker mit der Maus greifen und verschieben",
+            transport,
+            text="Marker ziehen | Mausrad = Zoom | mittlere Taste = Verschieben | Doppelklick = Reset",
             font=("Arial", 10), text_color="#64748b"
         )
-        lbl_drag.pack(side="left", padx=14, pady=(10, 0))
+        lbl_drag.grid(row=1, column=2, columnspan=2, pady=(6, 0), sticky="w")
 
         # --- Entscheidung ---------------------------------------------
         # Grid statt Pack: sonst wandern die rechts gepackten Buttons bei
