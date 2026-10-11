@@ -2639,41 +2639,52 @@ class EditMakerApp(ctk.CTk):
         start_t, end_t = float(rng[0]), float(rng[1])
         if end_t <= start_t:
             start_t, end_t = 0.0, float(self.audio_duration)
+        total_duration = end_t - start_t
 
+        # Wichtig: exakt die aufgezeichnete Passage ausschneiden. Ohne -ss/-t
+        # waere die WAV der komplette Song ab 0:00, waehrend die Marker relativ
+        # zum Aufnahmefenster sitzen - die Anzeige und Wiedergabe passten dann
+        # nicht mehr zum Song-Teil, in dem tatsaechlich aufgenommen wurde.
         temp_dir = tempfile.mkdtemp(prefix="autoedit_saved_cuts_")
         master_audio_wav = os.path.join(temp_dir, "master_audio.wav")
         try:
             cmd = [
                 self.ffmpeg_exe, "-y",
+                "-ss", f"{start_t:.3f}",
                 "-i", self.audio_path,
+                "-t", f"{total_duration:.3f}",
                 "-vn",
                 "-ac", "2", "-ar", "44100",
                 "-acodec", "pcm_s16le",
                 master_audio_wav
             ]
-            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if res.returncode != 0:
+                raise RuntimeError("FFmpeg Audio-Extraktion fehlgeschlagen.")
         except Exception as e:
             shutil.rmtree(temp_dir, ignore_errors=True)
-            self.show_error("Fehler", f"Audio konnte nicht vorbereitet werden:\n{e}")
+            self.show_error("Fehler", f"Audio-Vorbereitung fehlgeschlagen:\n{e}")
             return
 
-        from app import compute_waveform_envelope
-        onsets_arr = np.array([])
+        # Onsets aus genau dieser Passage - und ohne start_t, denn der Review
+        # rechnet durchgaengig relativ zum Fensteranfang (wie open_manual_recorder).
+        detected_onsets = []
         try:
-            y, sr = librosa.load(
-                self.audio_path, sr=22050,
-                offset=start_t, duration=max(1.0, end_t - start_t)
-            )
-            env_low = librosa.onset.onset_strength(y=y, sr=sr, fmax=280)
-            env_high = librosa.onset.onset_strength(y=y, sr=sr, fmin=800, fmax=5500)
+            y_m, sr_m = librosa.load(master_audio_wav, sr=22050)
+            y_perc = librosa.effects.percussive(y_m, margin=2.0)
+            env_low = librosa.onset.onset_strength(y=y_perc, sr=sr_m, fmax=280)
+            env_high = librosa.onset.onset_strength(y=y_perc, sr=sr_m, fmin=800, fmax=5500)
             onset_env = env_low * 1.0 + env_high * 0.65
-            frames = librosa.onset.onset_detect(
-                onset_envelope=onset_env, sr=sr, hop_length=512,
+            onset_frames = librosa.onset.onset_detect(
+                onset_envelope=onset_env, sr=sr_m, hop_length=512,
                 backtrack=True, wait=6, delta=0.07
             )
-            onsets_arr = librosa.frames_to_time(frames, sr=sr, hop_length=512) + start_t
+            detected_onsets = list(librosa.frames_to_time(onset_frames, sr=sr_m))
+            del y_m, y_perc, env_low, env_high, onset_env
         except Exception:
-            pass
+            detected_onsets = []
+
+        onsets_arr = np.array(detected_onsets) if len(detected_onsets) > 0 else None
 
         self.open_manual_review(
             start_t, end_t,
@@ -3864,6 +3875,16 @@ class EditMakerApp(ctk.CTk):
         win.title("Aufnahme pruefen")
         win.minsize(820, 520)
         win.transient(self)
+
+        # Welcher Ausschnitt wird gerade gehoert? Ohne diese Angabe war nicht
+        # erkennbar, ob die Wiedergabe beim richtigen Song-Teil startet.
+        src_name = os.path.basename(self.manual_review_source or self.audio_path or "")
+        ctk.CTkLabel(
+            win,
+            text=f"{src_name}  |  {start_t:.1f}s - {end_t:.1f}s"
+                 + (f"  ({duration:.1f}s lang)" if duration > 0 else ""),
+            font=("Arial", 11), text_color="#38bdf8"
+        ).pack(pady=(0, 6))
 
         ctk.CTkLabel(
             win, text="Ist die Aufnahme in Ordnung?",
