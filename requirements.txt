@@ -7,3 +7,4 @@ pygame
 Pillow
 opencv-python
 scipy
+tkinterdnd2

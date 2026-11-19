@@ -2,13 +2,61 @@
 
 Ein professionelles Beat-Sync Video-Editing Tool mit moderner CustomTkinter-Oberflaeche, hardwarebeschleunigter FFmpeg-Engine, praeziser Librosa-Audioanalyse und High-Impact Videoeffekten.
 
+## So geht's (30 Sekunden)
+
+1. **Clips rein** - "Clips / Bilder wählen" oder Dateien einfach ins Fenster ziehen
+   (Videos, Bilder, Song und `.aep`-Projekte werden automatisch einsortiert).
+2. **Song rein** - die Wellenform zeigt Beats und den KI-Drop.
+   Linksklick = Start, Rechtsklick = Ende, Mausrad = Zoom. Oder "Besten Hook finden".
+3. **Profil wählen** (oben) oder Effekte rechts einstellen.
+4. **Schnell-Vorschau** (480p, öffnet sich automatisch) - passt es, **Video Rendern**.
+
+Manuell schneiden: Modus "Manuell" + "Video Rendern" startet die Live-Aufnahme
+(Leertaste tippt Schnitte), danach das Review zum Nachjustieren und direkt den Render.
+
+**Tastenkürzel:** Strg+Z / Strg+Y Undo/Redo, Strg+S Projekt speichern, Strg+O Projekt
+laden, Strg+Enter Rendern, Strg+P Vorhören.
+
+## Neu in dieser Version
+
+- **Effekte feuern wieder**: Punch, Flash und Shake hingen an einer Kick-Analyse, die nur
+  mit einer unsichtbaren Option lief - im Normalfall gab es fast nur Whip-Pans. Jetzt wird
+  die Kick-Huelle immer berechnet, auch fuer manuelle Cuts (inkl. Drop-Zoom-Blur).
+- **"Zoom-Blur am Drop"** wurde von einer versteckten Option wieder abgeschaltet - behoben.
+- **Original-Clip-Sound** (15 % / 35 %) landet jetzt wirklich im fertigen Video
+  (wurde vorher beim finalen Mux verworfen), auch bei Speed-Ramp-Cuts.
+- **Hochformat wurde bei Punch/Whip kurz gestaucht** (Zwischenschritt auf ein Quadrat) - behoben.
+- **Mausrad-Zoom in der Haupt-Wellenform** stuerzte ab - behoben; die Wellenform ist
+  jetzt auch volle Breite statt ein schmaler Streifen.
+- **Review-Fenster**: Wiedergabe startet an der gewaehlten Position (Klick ins Leere),
+  der Cursor stimmt beim Zoomen, Pfeiltasten-Nudging funktioniert, Rechtsklick setzt/loescht
+  Cuts, Entf loescht den markierten Cut, Leertaste = Play.
+- **Live-Aufnahme**: eigene Tap-Flaeche (Klicks auf Regler zaehlen nicht mehr als Schnitt),
+  "Fertig"-Button bzw. Esc, Fortschrittsbalken. Die Vorbereitung laeuft im Hintergrund
+  statt das Fenster einzufrieren.
+- **Profile/Projekte** speichern jetzt alles (Effekt-Set, Akzente, Korn, Collage, Spin,
+  Zoom-Blur ...). Alte Presets mit ungueltigen Werten werden automatisch korrigiert.
+  Der wirkungslose "Stil"-Dropdown ist entfernt.
+- **Overlay-Start "Am erkannten Drop"** ist im UI waehlbar (die Presets nutzten ihn schon).
+- **Batch-Export** gab die Buttons mitten im Lauf wieder frei - behoben; Varianten
+  bekommen eigene Effekt-Seeds.
+- **Rendern mischt nicht mehr deine Medienliste um** (nur die Render-Kopie).
+- Medienliste mit Typ-Anzeige und Entfernen pro Datei, Drag & Drop, gemerkte Ordner,
+  automatische Dateinamen, Bestaetigung vor dem Loeschen, saubere Fehlermeldungen
+  (mit der echten ffmpeg-Ursache), kein Halb-Video bei Abbruch.
+- **HiDPI**: Dialoge bei 125/150 % Windows-Skalierung nicht mehr zu gross, Hauptfenster
+  passt sich dem Bildschirm an.
+- App startet auch ohne Audiogeraet; Analyse eines neuen Songs blockiert nicht mehr,
+  wenn der vorige noch analysiert wurde.
+
 ## Highlights & Features
 
 - **Manuelle Cuts als wiederverwendbare Sammlung**:
-  - Der Aufnahme-Review rendert nicht mehr sofort, sondern legt die Cuts in einer
-    Sammlung ab - aufgenommen, millisekundengenau nachjustiert, dann uebernommen.
+  - Das Review legt die Cuts in einer Sammlung ab - aufgenommen, millisekundengenau
+    nachjustiert, dann uebernommen. Kam die Aufnahme ueber "Video Rendern", wird
+    danach direkt gerendert.
   - **Punkt 3 - Beat-Sync & Timing** verwaltet die Sammlung:
-    `Jetzt aufnehmen`, `Verwenden`, `Ccuts ansehen`, `Ccuts verwerfen`.
+    `Jetzt aufnehmen`, `Beim Rendern verwenden`, `Cuts ansehen`, `Bereich laden`, `Verwerfen`.
   - Einmal aufnehmen, beliebig oft nutzen: **Video Rendern**,
     **Schnell-Vorschau** und **Batch-Export** verwenden dieselben Cuts.
   - **Projekt speichern** legt die Cuts in der `.aep` mit ab (Format-Version 3),
@@ -100,10 +148,10 @@ Ein professionelles Beat-Sync Video-Editing Tool mit moderner CustomTkinter-Ober
 - **Aufnahme-Review nach dem manuellen Schneiden**:
   - Nach dem Aufnehmen geht es nicht mehr direkt ins Rendern, sondern in eine Pruefansicht.
   - Wellenform des Auswahlbereichs mit einem Marker pro Cut (gruen = am Beat eingerastet, orange duenn = roher Tap) und Positionsanzeige waehrend der Wiedergabe.
-  - **Cuts direkt in der Wellenform verschieben**: Marker greifen und ziehen, rastet automatisch auf den naechsten echten Onset ein (90ms Radius). Laeuft ein Klickton mit, man hoert also beim Verschieben direkt, wo der Cut landet. Grenzen zu den Nachbar-Cuts werden eingehalten, damit nichts kollidiert.
+  - **Cuts direkt in der Wellenform verschieben**: Marker greifen und ziehen; mit "An Beats einrasten" auf den naechsten echten Onset (90ms Radius). Laeuft ein Klickton mit, man hoert also beim Verschieben direkt, wo der Cut landet. Grenzen zu den Nachbar-Cuts werden eingehalten, damit nichts kollidiert.
   - **Audio-Indikatoren**: ein Klickton markiert jeden Cut hoerbar, damit man ohne Rendern hoert, ob der Schnitt sitzt. Abschaltbar.
-  - Zusammenfassung "N Schnitte | X eingerastet | Y frei | Z%" plus Navigation (Von vorn / Zum ersten Cut).
-  - "Zufrieden - rendern" startet den Export, "Neu aufnehmen" verwirft und macht den Recorder erneut auf.
+  - Klick ins Leere setzt die Abspielposition, Rechtsklick setzt oder loescht einen Cut, Entf loescht den markierten.
+  - "Cuts uebernehmen" speichert (und rendert, wenn die Aufnahme ueber "Video Rendern" kam), "Neu aufnehmen" startet den Recorder erneut.
 - **KI Beat-Drop-Erkennung (Machine Learning)**:
   - Agglomerative Segmentierung (Chroma-CQT + MFCC) plus Multi-Band-Change-Point-Analyse.
   - Waehlt den Drop, der in den lautesten Abschnitt fuehrt - nicht den mit dem groessten relativen Sprung.
@@ -124,16 +172,15 @@ Ein professionelles Beat-Sync Video-Editing Tool mit moderner CustomTkinter-Ober
   - **Linksklick** setzt den Startpunkt, **Rechtsklick** setzt den Endpunkt.
   - Beim Vorhoeren laeuft ein gelber Playhead durch die Waveform, die aktuelle Position steht rechts daneben.
 - **KI-Auto-Reframe**: haelt das Subject im 9:16-Crop (YuNet-Gesichtserkennung, sonst Hautton-/Bewegungs-Tracking, zeitlich geglaettet).
-- **Schnell-Vorschau (Proxy)**: 480p/30fps-Proxy-Render (~3x schneller) um Settings vor dem Final-Render zu testen.
+- **Schnell-Vorschau (Proxy)**: 480p/30fps-Proxy-Render (~3x schneller), landet im Temp-Ordner und oeffnet sich direkt im Player.
   Die Vorschau aendert ausschliesslich Aufloesung, Framerate und CRF - Effekte, Crop, Collage und Timing sind identisch zum Export. Eine Vorschau, die anders aussieht als das Ergebnis, taugt nichts als Entscheidungsgrundlage.
 - **Batch-Export**: rendert N Varianten mit gemischter Clip-Reihenfolge in einem Durchlauf.
 - **Projekt-Speichern**: kompletter Arbeitsstand (Clips, Song, Trim, Effekte, Overlay) als `.aep`, mit relativen Pfaden.
-- **Undo/Redo**: bis zu 60 Schritte ueber alle Einstellungen, Medien und Trim-Punkte.
+- **Undo/Redo** (Strg+Z / Strg+Y): bis zu 60 Schritte ueber alle Einstellungen, Medien, Trim-Punkte, Cuts und Projekt-Laden.
 - **Restzeit-Anzeige**: ETA im Statusbereich waehrend des Clip-Renders.
-- **Bass-Pulse**: Full-Frame-Kick-Darkening, Staerke aus dem echten Low-Band-Onset-Env.
 - **Auto-Loudness**: EBU R128 Normalisierung (-14 LUFS, True-Peak-Limiter) auf dem Master-Audio.
 - **Audio-Mixing & Fade-Out**:
-  - Original Clip-Sound stummschalten oder zu 15%/35% dezent beibehalten (fuer In-Game Sounds/SFX).
+  - Original Clip-Sound stummschalten oder zu 15%/35% unter die Musik mischen (fuer In-Game Sounds/SFX).
   - Automatischer 0.8s Fade-Out am Ende gegen abruptes Abreissen.
 - **Prozesskontrolle & Schnellzugriff**:
   - Laufende Rendervorgaenge sauber per Knopfdruck abbrechen.
@@ -143,7 +190,7 @@ Ein professionelles Beat-Sync Video-Editing Tool mit moderner CustomTkinter-Ober
 ## Installation & Start
 
 ### Schnellstart (Windows)
-Doppelklick auf `start.bat`. Das Skript erstellt bei Bedarf eine virtuelle Umgebung (`venv`), installiert alle noetigen Abhaengigkeiten und startet die App.
+Doppelklick auf `start.bat`. Das Skript erstellt bei Bedarf eine virtuelle Umgebung (`venv`), installiert alle noetigen Abhaengigkeiten (inkl. `tkinterdnd2` fuer Drag & Drop - ohne laeuft die App auch, nur ohne Ziehen) und startet die App.
 
 ### Manuelle Installation
 
